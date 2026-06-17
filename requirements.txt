@@ -1,0 +1,5 @@
+python-telegram-bot==21.7
+telethon==1.36.0
+cryptography==43.0.0
+pymongo[srv]==4.7.3
+python-dotenv==1.0.1
