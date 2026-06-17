@@ -42,7 +42,7 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, ConversationHandler, ContextTypes, filters,
 )
-from telethon import TelegramClient
+from telethon import TelegramClient, events as telethon_events
 from telethon.sessions import StringSession
 from telethon.tl.types import MessageEmpty
 from telethon.errors import (
@@ -98,13 +98,20 @@ db = Database("bot_data.db")
     WAITING_SAVE_LINK,      # 8
     WAITING_BULK_SAVE_FIRST,# 9
     WAITING_BULK_SAVE_LAST, # 10
-) = range(11)
+    WAITING_WATCH_SOURCE,   # 11
+) = range(12)
 
 # ─────────────────────────────────────────────
 #  Global userbot reference
 # ─────────────────────────────────────────────
 userbot_client: Optional[TelegramClient] = None
 forward_task:   Optional[asyncio.Task]   = None
+
+# ── Auto-Forward globals ──────────────────────────────────────────
+auto_forward_handler = None          # registered Telethon event handler fn
+auto_forward_task_user: Optional[int] = None  # user who owns the active watch
+_pending_albums: Dict[int, List]    = {}      # grouped_id → [Message, ...]
+_album_tasks:   Dict[int, asyncio.Task] = {}  # grouped_id → flush Task
 
 # ─────────────────────────────────────────────
 #  DC address table  (for Pyrogram → Telethon conversion)
@@ -404,10 +411,17 @@ HELP_TEXT = (
     "▸ `/login` — Connect userbot (string session or phone)\n"
     "▸ `/forward` — Copy a message range from any source channel\n"
     "▸ `/save` — Fetch & repost a single restricted message link\n"
+    "▸ `/watch` — 🔴 *Auto-forward* new messages from a source channel\n"
+    "▸ `/unwatch` — Stop auto-forwarding\n"
     "▸ `/status` — Show bot status & downloads folder info\n"
     "▸ `/cleanup` — Manually cleanup old downloaded files\n"
     "▸ `/stop` — Stop an active copy job\n"
     "▸ `/settings` — Add / remove destination channels\n\n"
+    "🔴 *Auto-Forward (/watch):*\n"
+    "The userbot listens for *new messages* in a source channel and\n"
+    "instantly forwards them to all your destination channels.\n"
+    "Albums (media groups) are batched and sent together.\n"
+    "Auto-forward survives bot restarts — runs until you `/unwatch`.\n\n"
     "🔐 *Supported Session Formats:*\n"
     "• Telethon StringSession\n"
     "• Pyrogram StringSession v1 & v2 *(auto-converted)*\n"
@@ -421,7 +435,7 @@ HELP_TEXT = (
     "💾 *Downloads Folder:*\n"
     "Media files are automatically downloaded to `./downloads/` folder\n"
     "and cleaned up after sending. Use `/cleanup` to manually remove old files.\n\n"
-    "⏱️ *Rate Limiting:*\n"
+    "⏱️ *Rate Limiting (for /forward & /save):*\n"
     "• 1 message per second\n"
     "• 30 messages per minute\n"
     "• 30 second break after every 30 messages"
@@ -457,17 +471,24 @@ async def status_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     session  = db.get_session(user_id)
     dests    = db.get_destination_channels(user_id)
     active   = forward_task and not forward_task.done()
-    
-    # Get downloads folder info
-    downloads_count = len(list(DOWNLOADS_DIR.glob("*"))) if DOWNLOADS_DIR.exists() else 0
-    downloads_size = sum(f.stat().st_size for f in DOWNLOADS_DIR.glob("*") if f.is_file())
+
+    # Auto-forward watch status
+    watch_cfg    = db.get_watch_config(user_id)
+    watching     = bool(watch_cfg and watch_cfg.get("is_active") and auto_forward_task_user == user_id)
+    watch_source = (watch_cfg or {}).get("source_channel", "—")
+
+    # Downloads folder info
+    downloads_count   = len(list(DOWNLOADS_DIR.glob("*"))) if DOWNLOADS_DIR.exists() else 0
+    downloads_size    = sum(f.stat().st_size for f in DOWNLOADS_DIR.glob("*") if f.is_file())
     downloads_size_mb = downloads_size / (1024 * 1024)
-    
+
+    watch_line = f"\n   └─ Source: `{watch_source}`" if watching else ""
     text = (
         "📊 *Bot Status*\n\n"
-        f"🔐 Userbot:      {'✅ Connected' if session else '❌ Not connected'}\n"
-        f"📤 Destinations: {len(dests)} channel(s)\n"
-        f"🔄 Copy job:     {'▶️ Running' if active else '⏹ Idle'}\n\n"
+        f"🔐 Userbot:       {'✅ Connected' if session else '❌ Not connected'}\n"
+        f"📤 Destinations:  {len(dests)} channel(s)\n"
+        f"🔄 Copy job:      {'▶️ Running' if active else '⏹ Idle'}\n"
+        f"🔴 Auto-forward:  {'▶️ Watching' if watching else '⏹ Off'}{watch_line}\n\n"
         f"💾 *Downloads Folder:*\n"
         f"📁 Files: `{downloads_count}`\n"
         f"💽 Size: `{downloads_size_mb:.2f} MB`\n"
@@ -1818,6 +1839,226 @@ async def _safe_send(
 
 
 # ═══════════════════════════════════════════════════════
+#  AUTO-FORWARD ENGINE  (real-time /watch feature)
+# ═══════════════════════════════════════════════════════
+
+async def _flush_album(grouped_id: int, client: TelegramClient, user_id: int):
+    """
+    Wait briefly (1.5 s) then send all collected album parts to destinations.
+    The delay lets every part of the media group arrive before we upload.
+    """
+    await asyncio.sleep(1.5)
+    album = _pending_albums.pop(grouped_id, [])
+    _album_tasks.pop(grouped_id, None)
+    if not album:
+        return
+    album.sort(key=lambda m: m.id)
+    destinations = db.get_destination_channel_ids(user_id)
+    for dest_str in destinations:
+        try:
+            dest_entity = await client.get_entity(_parse_channel(dest_str))
+            await _safe_send(client, dest_entity, album=album)
+        except Exception as exc:
+            logger.error(f"Auto-forward album → {dest_str} failed: {exc}")
+
+
+def _stop_auto_forward(client: Optional[TelegramClient] = None):
+    """Remove the registered NewMessage event handler (if any)."""
+    global auto_forward_handler, auto_forward_task_user
+    if client and auto_forward_handler:
+        try:
+            client.remove_event_handler(auto_forward_handler)
+            logger.info("Auto-forward event handler removed.")
+        except Exception as exc:
+            logger.warning(f"Could not remove auto-forward handler: {exc}")
+    auto_forward_handler    = None
+    auto_forward_task_user  = None
+    # Cancel pending album timers
+    for task in list(_album_tasks.values()):
+        task.cancel()
+    _album_tasks.clear()
+    _pending_albums.clear()
+
+
+async def _start_auto_forward(user_id: int, source_channel: str) -> bool:
+    """
+    Register a Telethon NewMessage handler on source_channel.
+    Every new message (or album) is instantly forwarded to the user's
+    destination channels using _safe_send() — no forward tag, full media.
+
+    Returns True if the handler was registered successfully.
+    """
+    global auto_forward_handler, auto_forward_task_user
+
+    client = await get_userbot(user_id)
+    if not client:
+        logger.error("_start_auto_forward: no live userbot client.")
+        return False
+
+    # Remove any existing handler first
+    _stop_auto_forward(client)
+
+    try:
+        source_entity = await client.get_entity(_parse_channel(source_channel))
+    except Exception as exc:
+        logger.error(f"_start_auto_forward: cannot resolve '{source_channel}': {exc}")
+        return False
+
+    # Inner handler — runs in Telethon's event loop for every new message
+    async def _on_new_message(event):
+        try:
+            msg = event.message
+            if not msg or isinstance(msg, MessageEmpty):
+                return
+
+            destinations = db.get_destination_channel_ids(user_id)
+            if not destinations:
+                return
+
+            grouped_id = getattr(msg, "grouped_id", None)
+
+            if grouped_id:
+                # ── Album: batch parts, flush after 1.5 s ──────────
+                if grouped_id not in _pending_albums:
+                    _pending_albums[grouped_id] = []
+                _pending_albums[grouped_id].append(msg)
+
+                # Reset flush timer on every new part
+                existing = _album_tasks.get(grouped_id)
+                if existing and not existing.done():
+                    existing.cancel()
+                _album_tasks[grouped_id] = asyncio.create_task(
+                    _flush_album(grouped_id, client, user_id)
+                )
+            else:
+                # ── Single message: forward immediately ────────────
+                for dest_str in destinations:
+                    try:
+                        dest_entity = await client.get_entity(_parse_channel(dest_str))
+                        await _safe_send(client, dest_entity, msg=msg)
+                    except Exception as exc:
+                        logger.error(f"Auto-forward → {dest_str} failed: {exc}")
+
+        except Exception as exc:
+            logger.exception(f"_on_new_message error: {exc}")
+
+    # Register the handler scoped to the source entity
+    client.add_event_handler(
+        _on_new_message,
+        telethon_events.NewMessage(chats=source_entity),
+    )
+
+    auto_forward_handler   = _on_new_message
+    auto_forward_task_user = user_id
+
+    # Persist active state
+    db.set_watch_active(user_id, True)
+
+    logger.info(f"Auto-forward STARTED: '{source_channel}' → user {user_id}'s destinations")
+    return True
+
+
+# ═══════════════════════════════════════════════════════
+#  /watch CONVERSATION
+# ═══════════════════════════════════════════════════════
+
+async def watch_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Entry point for /watch — asks for the source channel to monitor."""
+    user_id = update.effective_user.id
+
+    if not db.get_session(user_id):
+        await update.message.reply_text("❌ Userbot not logged in. Use /login first.")
+        return ConversationHandler.END
+
+    if not db.get_destination_channel_ids(user_id):
+        await update.message.reply_text("❌ No destination channels set. Add one via /settings.")
+        return ConversationHandler.END
+
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_conv")]])
+    await update.message.reply_text(
+        "🔴 *Auto-Forward Setup*\n\n"
+        "Send the *source channel* to watch for new messages.\n\n"
+        "Accepted formats:\n"
+        "• `@username`\n"
+        "• `-1001234567890`\n"
+        "• `https://t.me/channelname`\n\n"
+        "_The userbot must have joined (or be an admin of) this channel._",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+    return WAITING_WATCH_SOURCE
+
+
+async def receive_watch_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Validate source channel, start the auto-forward handler, save to DB."""
+    user_id = update.effective_user.id
+    raw     = (update.message.text or "").strip()
+
+    if not validate_channel_format(raw):
+        await update.message.reply_text(
+            "❌ Invalid channel format.\n\n"
+            "Accepted formats:\n"
+            "• `@username`\n"
+            "• `-1001234567890`\n"
+            "• `https://t.me/channelname`",
+            parse_mode="Markdown",
+        )
+        return WAITING_WATCH_SOURCE
+
+    source = normalise_channel(raw)
+    msg    = await update.message.reply_text(f"⏳ Connecting to `{source}`…", parse_mode="Markdown")
+
+    # Save config first so restart-recovery works even if the next step is slow
+    db.save_watch_config(user_id, source)
+
+    ok = await _start_auto_forward(user_id, source)
+    if not ok:
+        db.set_watch_active(user_id, False)
+        await msg.edit_text(
+            f"❌ *Cannot access* `{source}`\n\n"
+            "Make sure the userbot has joined the channel, then try again.",
+            parse_mode="Markdown",
+        )
+        return ConversationHandler.END
+
+    await msg.edit_text(
+        f"✅ *Auto-forward active!*\n\n"
+        f"🔴 Watching: `{source}`\n"
+        f"📤 Destinations: {len(db.get_destination_channel_ids(user_id))} channel(s)\n\n"
+        "Every new message will be instantly forwarded.\n"
+        "Use /unwatch to stop.",
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END
+
+
+# ═══════════════════════════════════════════════════════
+#  /unwatch COMMAND
+# ═══════════════════════════════════════════════════════
+
+async def unwatch_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Stop auto-forwarding and clear the watch config."""
+    user_id = update.effective_user.id
+    global userbot_client
+
+    watch_cfg = db.get_watch_config(user_id)
+    if not watch_cfg or not watch_cfg.get("is_active"):
+        await update.message.reply_text("⏹ Auto-forward is not currently active.")
+        return
+
+    _stop_auto_forward(userbot_client)
+    db.set_watch_active(user_id, False)
+
+    source = watch_cfg.get("source_channel", "unknown")
+    await update.message.reply_text(
+        f"⏹ *Auto-forward stopped.*\n\n"
+        f"Was watching: `{source}`\n\n"
+        "Use /watch to start again.",
+        parse_mode="Markdown",
+    )
+
+
+# ═══════════════════════════════════════════════════════
 #  CORE COPY LOOP (for /forward)
 # ═══════════════════════════════════════════════════════
 
@@ -2195,11 +2436,23 @@ def main():
         per_message=False,
     )
 
+    watch_conv = ConversationHandler(
+        entry_points=[CommandHandler("watch", watch_command)],
+        states={
+            WAITING_WATCH_SOURCE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_watch_source)
+            ],
+        },
+        fallbacks=[CallbackQueryHandler(button_handler, pattern="^cancel_conv$")],
+        per_message=False,
+    )
+
     # ConversationHandlers must be registered before the generic button_handler
     app.add_handler(login_conv)
     app.add_handler(dest_conv)
     app.add_handler(forward_conv)
     app.add_handler(save_conv)
+    app.add_handler(watch_conv)
 
     app.add_handler(CommandHandler("start",    start))
     app.add_handler(CommandHandler("help",     help_command))
@@ -2207,6 +2460,7 @@ def main():
     app.add_handler(CommandHandler("stop",     stop_command))
     app.add_handler(CommandHandler("cleanup",  cleanup_command))
     app.add_handler(CommandHandler("status",   status_command))
+    app.add_handler(CommandHandler("unwatch",  unwatch_command))
     app.add_handler(CallbackQueryHandler(button_handler))
 
     async def post_init(application):
@@ -2217,10 +2471,28 @@ def main():
             BotCommand("settings", "Manage destination channels"),
             BotCommand("forward",  "Copy a message range to destinations"),
             BotCommand("save",     "Fetch & repost a single restricted message"),
+            BotCommand("watch",    "Auto-forward new messages from a channel"),
+            BotCommand("unwatch",  "Stop auto-forwarding"),
             BotCommand("status",   "Show bot status & downloads folder info"),
             BotCommand("cleanup",  "Cleanup old downloaded files"),
             BotCommand("stop",     "Stop active copy job"),
         ])
+
+        # ── Restart-recovery: resume any active auto-forward sessions ──
+        # When the bot restarts (e.g. Koyeb redeploy), re-attach the
+        # Telethon event handler for any user who had /watch active.
+        try:
+            active_watches = db.get_all_active_watches()
+            for watch in active_watches:
+                uid = watch["user_id"]
+                src = watch["source_channel"]
+                logger.info(f"Restart-recovery: resuming auto-forward for user {uid} → {src}")
+                ok = await _start_auto_forward(uid, src)
+                if not ok:
+                    logger.warning(f"Restart-recovery: failed to resume watch for user {uid}")
+                    db.set_watch_active(uid, False)
+        except Exception as exc:
+            logger.error(f"Restart-recovery error: {exc}")
 
     app.post_init = post_init
 

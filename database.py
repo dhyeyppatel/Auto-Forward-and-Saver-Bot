@@ -152,6 +152,7 @@ class Database:
             )
             db["source_channels"].create_index("user_id", unique=True, sparse=True)
             db["admins"].create_index("user_id", unique=True, sparse=True)
+            db["watch_config"].create_index("user_id", unique=True, sparse=True)
             logger.info("MongoDB indexes ensured.")
         except Exception as exc:
             # Log but don't crash — indexes are performance/safety helpers,
@@ -540,3 +541,75 @@ class Database:
         except Exception as exc:
             logger.error(f"Error removing admin: {exc}")
             return False
+
+    # ─────────────────────────────────────────────
+    #  Watch Config Management  (auto-forward /watch)
+    # ─────────────────────────────────────────────
+
+    def save_watch_config(self, user_id: int, source_channel: str) -> bool:
+        """Save (upsert) the auto-forward source channel for a user."""
+        try:
+            self._col("watch_config").update_one(
+                {"user_id": user_id},
+                {
+                    "$set": {
+                        "user_id": user_id,
+                        "source_channel": source_channel,
+                        "is_active": True,
+                        "updated_at": self._now(),
+                    },
+                    "$setOnInsert": {"created_at": self._now()},
+                },
+                upsert=True,
+            )
+            logger.info(f"Watch config saved for user {user_id}: {source_channel}")
+            return True
+        except Exception as exc:
+            logger.error(f"Error saving watch config: {exc}")
+            return False
+
+    def get_watch_config(self, user_id: int) -> Optional[Dict]:
+        """Get the auto-forward config for a user, or None if not set."""
+        try:
+            return self._col("watch_config").find_one(
+                {"user_id": user_id}, {"_id": 0}
+            )
+        except Exception as exc:
+            logger.error(f"Error getting watch config: {exc}")
+            return None
+
+    def set_watch_active(self, user_id: int, is_active: bool) -> bool:
+        """Enable or disable auto-forward for a user without clearing the config."""
+        try:
+            self._col("watch_config").update_one(
+                {"user_id": user_id},
+                {"$set": {"is_active": is_active, "updated_at": self._now()}},
+            )
+            return True
+        except Exception as exc:
+            logger.error(f"Error setting watch active: {exc}")
+            return False
+
+    def clear_watch_config(self, user_id: int) -> bool:
+        """Fully delete the auto-forward config for a user."""
+        try:
+            self._col("watch_config").delete_one({"user_id": user_id})
+            return True
+        except Exception as exc:
+            logger.error(f"Error clearing watch config: {exc}")
+            return False
+
+    def get_all_active_watches(self) -> List[Dict]:
+        """
+        Return all watch configs with is_active=True.
+        Used on bot startup to restore auto-forward sessions after a restart.
+        """
+        try:
+            return list(
+                self._col("watch_config").find(
+                    {"is_active": True}, {"_id": 0}
+                )
+            )
+        except Exception as exc:
+            logger.error(f"Error getting active watches: {exc}")
+            return []
