@@ -25,6 +25,8 @@ import struct
 import base64
 import ipaddress
 import shutil
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
@@ -2100,6 +2102,41 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════
+#  HEALTH CHECK SERVER  (required for Koyeb Web Service)
+# ═══════════════════════════════════════════════════════
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    """
+    Minimal HTTP handler that satisfies Koyeb's health-check probe.
+    Responds 200 OK to any GET request — keeps the free Web Service alive.
+    """
+    def do_GET(self):
+        body = b"OK"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    # Silence HTTP access log lines so they don't clutter bot logs
+    def log_message(self, fmt, *args):
+        pass
+
+
+def _start_health_server():
+    """
+    Run a tiny HTTP server in a background daemon thread.
+    Koyeb's free Web Service tier requires an HTTP listener on $PORT.
+    Using a daemon thread means it exits automatically when the main
+    process exits — no cleanup needed.
+    """
+    port = int(os.getenv("PORT", "8000"))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    logger.info(f"Health-check server listening on port {port}")
+    server.serve_forever()
+
+
+# ═══════════════════════════════════════════════════════
 #  APPLICATION SETUP
 # ═══════════════════════════════════════════════════════
 
@@ -2186,6 +2223,12 @@ def main():
         ])
 
     app.post_init = post_init
+
+    # Start the HTTP health-check server in a background daemon thread
+    # BEFORE run_polling so Koyeb marks the service healthy right away.
+    health_thread = threading.Thread(target=_start_health_server, daemon=True)
+    health_thread.start()
+
     logger.info("Bot starting…")
     app.run_polling(drop_pending_updates=True)
 
