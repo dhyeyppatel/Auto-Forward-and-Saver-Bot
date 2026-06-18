@@ -153,6 +153,29 @@ class Database:
             db["source_channels"].create_index("user_id", unique=True, sparse=True)
             db["admins"].create_index("user_id", unique=True, sparse=True)
             db["watch_config"].create_index("user_id", unique=True, sparse=True)
+            # ── New collections for route-based forwarding ─────────────
+            db["user_sources"].create_index(
+                [("user_id", ASCENDING), ("channel_id", ASCENDING)], unique=True, sparse=True
+            )
+            db["routes"].create_index(
+                [("user_id", ASCENDING), ("source", ASCENDING), ("destination", ASCENDING)],
+                sparse=True,
+            )
+            db["global_configs"].create_index("user_id", unique=True, sparse=True)
+            db["blacklists"].create_index(
+                [("user_id", ASCENDING), ("keyword", ASCENDING)], unique=True, sparse=True
+            )
+            db["whitelists"].create_index(
+                [("user_id", ASCENDING), ("keyword", ASCENDING)], unique=True, sparse=True
+            )
+            db["user_filters"].create_index(
+                [("user_id", ASCENDING), ("target_user_id", ASCENDING)], unique=True, sparse=True
+            )
+            db["message_mappings"].create_index(
+                [("user_id", ASCENDING), ("source_chat", ASCENDING), ("source_msg_id", ASCENDING)]
+            )
+            # TTL index: auto-delete message mappings after 7 days
+            db["message_mappings"].create_index("created_at", expireAfterSeconds=604_800)
             logger.info("MongoDB indexes ensured.")
         except Exception as exc:
             # Log but don't crash — indexes are performance/safety helpers,
@@ -613,3 +636,438 @@ class Database:
         except Exception as exc:
             logger.error(f"Error getting active watches: {exc}")
             return []
+
+    # ─────────────────────────────────────────────
+    #  User Source Channels  (route system)
+    # ─────────────────────────────────────────────
+
+    def add_source_channel(self, user_id: int, channel_id: str, channel_name: str = "") -> bool:
+        """Add or re-activate a source channel for route-based forwarding."""
+        try:
+            self._col("user_sources").update_one(
+                {"user_id": user_id, "channel_id": channel_id},
+                {
+                    "$set": {
+                        "user_id": user_id,
+                        "channel_id": channel_id,
+                        "channel_name": channel_name,
+                        "is_active": True,
+                        "updated_at": self._now(),
+                    },
+                    "$setOnInsert": {"created_at": self._now()},
+                },
+                upsert=True,
+            )
+            return True
+        except Exception as exc:
+            logger.error(f"Error adding source channel: {exc}")
+            return False
+
+    def get_source_channels(self, user_id: int) -> List[Dict]:
+        try:
+            return list(self._col("user_sources").find(
+                {"user_id": user_id, "is_active": True}, {"_id": 0}
+            ).sort("created_at", -1))
+        except Exception as exc:
+            logger.error(f"Error getting source channels: {exc}")
+            return []
+
+    def get_source_channel_ids(self, user_id: int) -> List[str]:
+        return [s["channel_id"] for s in self.get_source_channels(user_id)]
+
+    def remove_source_channel(self, user_id: int, channel_id: str) -> bool:
+        try:
+            self._col("user_sources").update_one(
+                {"user_id": user_id, "channel_id": channel_id},
+                {"$set": {"is_active": False}},
+            )
+            return True
+        except Exception as exc:
+            logger.error(f"Error removing source channel: {exc}")
+            return False
+
+    def remove_source_channel_by_index(self, user_id: int, index: int) -> bool:
+        try:
+            sources = self.get_source_channels(user_id)
+            if 0 <= index < len(sources):
+                return self.remove_source_channel(user_id, sources[index]["channel_id"])
+            return False
+        except Exception as exc:
+            return False
+
+    # ─────────────────────────────────────────────
+    #  Routes
+    # ─────────────────────────────────────────────
+
+    def add_route(self, user_id: int, source: str, destination: str) -> bool:
+        """Create a forwarding route. Returns False if duplicate."""
+        try:
+            existing = self._col("routes").find_one({
+                "user_id": user_id, "source": source,
+                "destination": destination, "is_active": True,
+            })
+            if existing:
+                return False
+            self._col("routes").insert_one({
+                "user_id": user_id,
+                "source": source,
+                "destination": destination,
+                "is_active": True,
+                "created_at": self._now(),
+            })
+            return True
+        except Exception as exc:
+            logger.error(f"Error adding route: {exc}")
+            return False
+
+    def get_routes(self, user_id: int) -> List[Dict]:
+        try:
+            return list(self._col("routes").find(
+                {"user_id": user_id, "is_active": True}, {"_id": 0}
+            ).sort("created_at", 1))
+        except Exception as exc:
+            logger.error(f"Error getting routes: {exc}")
+            return []
+
+    def remove_route_by_index(self, user_id: int, index: int) -> bool:
+        try:
+            routes = self.get_routes(user_id)
+            if 0 <= index < len(routes):
+                r = routes[index]
+                self._col("routes").update_one(
+                    {"user_id": user_id, "source": r["source"], "destination": r["destination"]},
+                    {"$set": {"is_active": False}},
+                )
+                return True
+            return False
+        except Exception as exc:
+            logger.error(f"Error removing route: {exc}")
+            return False
+
+    def get_destinations_for_source(self, user_id: int, source: str) -> List[str]:
+        """Get all destination channels mapped to a given source."""
+        try:
+            docs = self._col("routes").find(
+                {"user_id": user_id, "source": source, "is_active": True},
+                {"destination": 1, "_id": 0},
+            )
+            return [d["destination"] for d in docs]
+        except Exception as exc:
+            logger.error(f"Error getting destinations for source: {exc}")
+            return []
+
+    def get_unique_active_sources(self, user_id: int) -> List[str]:
+        """Unique source channels across all active routes."""
+        try:
+            seen: List[str] = []
+            for r in self.get_routes(user_id):
+                if r["source"] not in seen:
+                    seen.append(r["source"])
+            return seen
+        except Exception as exc:
+            logger.error(f"Error getting unique sources: {exc}")
+            return []
+
+    # ─────────────────────────────────────────────
+    #  Global Config
+    # ─────────────────────────────────────────────
+
+    _CONFIG_DEFAULTS: Dict = {
+        "delay": 0,
+        "begin_text": "",
+        "end_text": "",
+        "copy_mode": True,      # True=copy (no fwd tag), False=native forward
+        "media_enabled": True,
+        "text_enabled": True,
+        "url_preview": False,
+        "edit_sync": False,
+        "delete_sync": False,
+    }
+
+    def get_config(self, user_id: int) -> Dict:
+        """Return user config merged with defaults."""
+        try:
+            doc = self._col("global_configs").find_one({"user_id": user_id}, {"_id": 0})
+            cfg = dict(self._CONFIG_DEFAULTS)
+            if doc:
+                for k in self._CONFIG_DEFAULTS:
+                    if k in doc:
+                        cfg[k] = doc[k]
+            return cfg
+        except Exception as exc:
+            logger.error(f"Error getting config: {exc}")
+            return dict(self._CONFIG_DEFAULTS)
+
+    def set_config(self, user_id: int, **kwargs) -> bool:
+        try:
+            valid = {k: v for k, v in kwargs.items() if k in self._CONFIG_DEFAULTS}
+            if not valid:
+                return False
+            self._col("global_configs").update_one(
+                {"user_id": user_id},
+                {
+                    "$set": {**valid, "updated_at": self._now()},
+                    "$setOnInsert": {"user_id": user_id, "created_at": self._now()},
+                },
+                upsert=True,
+            )
+            return True
+        except Exception as exc:
+            logger.error(f"Error setting config: {exc}")
+            return False
+
+    def reset_config(self, user_id: int) -> bool:
+        try:
+            self._col("global_configs").delete_one({"user_id": user_id})
+            return True
+        except Exception as exc:
+            logger.error(f"Error resetting config: {exc}")
+            return False
+
+    # ─────────────────────────────────────────────
+    #  Text Replacement Filters
+    # ─────────────────────────────────────────────
+
+    def add_filter(self, user_id: int, pattern: str, replacement: str,
+                   is_regex: bool = False) -> bool:
+        try:
+            self._col("filters").insert_one({
+                "user_id": user_id,
+                "pattern": pattern,
+                "replacement": replacement,
+                "is_regex": is_regex,
+                "created_at": self._now(),
+            })
+            return True
+        except Exception as exc:
+            logger.error(f"Error adding filter: {exc}")
+            return False
+
+    def get_filters(self, user_id: int) -> List[Dict]:
+        try:
+            return list(self._col("filters").find(
+                {"user_id": user_id}, {"_id": 0}
+            ).sort("created_at", 1))
+        except Exception as exc:
+            logger.error(f"Error getting filters: {exc}")
+            return []
+
+    def remove_filter_by_index(self, user_id: int, index: int) -> bool:
+        try:
+            filters = self.get_filters(user_id)
+            if 0 <= index < len(filters):
+                f = filters[index]
+                self._col("filters").delete_one({
+                    "user_id": user_id,
+                    "pattern": f["pattern"],
+                    "replacement": f["replacement"],
+                })
+                return True
+            return False
+        except Exception as exc:
+            logger.error(f"Error removing filter: {exc}")
+            return False
+
+    # ─────────────────────────────────────────────
+    #  Blacklist
+    # ─────────────────────────────────────────────
+
+    def add_blacklist(self, user_id: int, keyword: str) -> bool:
+        try:
+            self._col("blacklists").update_one(
+                {"user_id": user_id, "keyword": keyword.lower()},
+                {"$setOnInsert": {
+                    "user_id": user_id, "keyword": keyword.lower(),
+                    "created_at": self._now(),
+                }},
+                upsert=True,
+            )
+            return True
+        except Exception as exc:
+            logger.error(f"Error adding blacklist keyword: {exc}")
+            return False
+
+    def get_blacklist(self, user_id: int) -> List[str]:
+        try:
+            return [d["keyword"] for d in self._col("blacklists").find(
+                {"user_id": user_id}, {"keyword": 1, "_id": 0}
+            ).sort("created_at", 1)]
+        except Exception as exc:
+            logger.error(f"Error getting blacklist: {exc}")
+            return []
+
+    def remove_blacklist(self, user_id: int, keyword: str) -> bool:
+        try:
+            self._col("blacklists").delete_one({"user_id": user_id, "keyword": keyword.lower()})
+            return True
+        except Exception as exc:
+            logger.error(f"Error removing blacklist: {exc}")
+            return False
+
+    def remove_blacklist_by_index(self, user_id: int, index: int) -> bool:
+        try:
+            items = self.get_blacklist(user_id)
+            if 0 <= index < len(items):
+                return self.remove_blacklist(user_id, items[index])
+            return False
+        except Exception as exc:
+            return False
+
+    # ─────────────────────────────────────────────
+    #  Whitelist
+    # ─────────────────────────────────────────────
+
+    def add_whitelist(self, user_id: int, keyword: str) -> bool:
+        try:
+            self._col("whitelists").update_one(
+                {"user_id": user_id, "keyword": keyword.lower()},
+                {"$setOnInsert": {
+                    "user_id": user_id, "keyword": keyword.lower(),
+                    "created_at": self._now(),
+                }},
+                upsert=True,
+            )
+            return True
+        except Exception as exc:
+            logger.error(f"Error adding whitelist keyword: {exc}")
+            return False
+
+    def get_whitelist(self, user_id: int) -> List[str]:
+        try:
+            return [d["keyword"] for d in self._col("whitelists").find(
+                {"user_id": user_id}, {"keyword": 1, "_id": 0}
+            ).sort("created_at", 1)]
+        except Exception as exc:
+            logger.error(f"Error getting whitelist: {exc}")
+            return []
+
+    def remove_whitelist(self, user_id: int, keyword: str) -> bool:
+        try:
+            self._col("whitelists").delete_one({"user_id": user_id, "keyword": keyword.lower()})
+            return True
+        except Exception as exc:
+            logger.error(f"Error removing whitelist: {exc}")
+            return False
+
+    def remove_whitelist_by_index(self, user_id: int, index: int) -> bool:
+        try:
+            items = self.get_whitelist(user_id)
+            if 0 <= index < len(items):
+                return self.remove_whitelist(user_id, items[index])
+            return False
+        except Exception as exc:
+            return False
+
+    # ─────────────────────────────────────────────
+    #  User Filters (forward only from these senders)
+    # ─────────────────────────────────────────────
+
+    def add_user_filter(self, user_id: int, target_user_id: int) -> bool:
+        try:
+            self._col("user_filters").update_one(
+                {"user_id": user_id, "target_user_id": target_user_id},
+                {"$setOnInsert": {
+                    "user_id": user_id, "target_user_id": target_user_id,
+                    "created_at": self._now(),
+                }},
+                upsert=True,
+            )
+            return True
+        except Exception as exc:
+            logger.error(f"Error adding user filter: {exc}")
+            return False
+
+    def get_user_filters(self, user_id: int) -> List[int]:
+        try:
+            return [d["target_user_id"] for d in self._col("user_filters").find(
+                {"user_id": user_id}, {"target_user_id": 1, "_id": 0}
+            )]
+        except Exception as exc:
+            logger.error(f"Error getting user filters: {exc}")
+            return []
+
+    def remove_user_filter(self, user_id: int, target_user_id: int) -> bool:
+        try:
+            self._col("user_filters").delete_one({
+                "user_id": user_id, "target_user_id": target_user_id
+            })
+            return True
+        except Exception as exc:
+            logger.error(f"Error removing user filter: {exc}")
+            return False
+
+    def clear_user_filters(self, user_id: int) -> bool:
+        try:
+            self._col("user_filters").delete_many({"user_id": user_id})
+            return True
+        except Exception as exc:
+            return False
+
+    # ─────────────────────────────────────────────
+    #  Message Mappings  (edit/delete sync)
+    # ─────────────────────────────────────────────
+
+    def save_message_mapping(self, user_id: int, source_chat: str, source_msg_id: int,
+                             dest_chat: str, dest_msg_id: int) -> bool:
+        try:
+            self._col("message_mappings").insert_one({
+                "user_id": user_id,
+                "source_chat": source_chat,
+                "source_msg_id": source_msg_id,
+                "dest_chat": dest_chat,
+                "dest_msg_id": dest_msg_id,
+                "created_at": self._now(),
+            })
+            return True
+        except Exception as exc:
+            logger.error(f"Error saving message mapping: {exc}")
+            return False
+
+    def get_message_mappings(self, user_id: int, source_chat: str,
+                             source_msg_id: int) -> List[Dict]:
+        try:
+            return list(self._col("message_mappings").find(
+                {"user_id": user_id, "source_chat": source_chat,
+                 "source_msg_id": source_msg_id},
+                {"_id": 0},
+            ))
+        except Exception as exc:
+            logger.error(f"Error getting message mappings: {exc}")
+            return []
+
+    def delete_message_mappings(self, user_id: int, source_chat: str,
+                                source_msg_id: int) -> bool:
+        try:
+            self._col("message_mappings").delete_many({
+                "user_id": user_id, "source_chat": source_chat,
+                "source_msg_id": source_msg_id,
+            })
+            return True
+        except Exception as exc:
+            return False
+
+    # ─────────────────────────────────────────────
+    #  Delete All User Data
+    # ─────────────────────────────────────────────
+
+    def delete_all_user_data(self, user_id: int) -> bool:
+        """Permanently delete every record belonging to a user across all collections."""
+        try:
+            for col in [
+                "users", "sessions", "destination_channels", "source_channels",
+                "admins", "watch_config", "user_sources", "routes",
+                "global_configs", "filters", "blacklists", "whitelists",
+                "user_filters", "message_mappings",
+            ]:
+                try:
+                    if col in ("destination_channels", "user_sources", "routes"):
+                        self._col(col).delete_many({"user_id": user_id})
+                    else:
+                        self._col(col).delete_many({"user_id": user_id})
+                except Exception:
+                    pass
+            logger.info(f"All data deleted for user {user_id}")
+            return True
+        except Exception as exc:
+            logger.error(f"Error deleting user data: {exc}")
+            return False

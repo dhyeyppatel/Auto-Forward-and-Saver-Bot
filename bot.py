@@ -99,7 +99,22 @@ db = Database("bot_data.db")
     WAITING_BULK_SAVE_FIRST,# 9
     WAITING_BULK_SAVE_LAST, # 10
     WAITING_WATCH_SOURCE,   # 11
-) = range(12)
+    WAITING_INCOMING,       # 12
+    WAITING_OUTGOING,       # 13
+    WAITING_ADD_ROUTE_SRC,  # 14
+    WAITING_ADD_ROUTE_DST,  # 15
+    WAITING_FILTER,         # 16
+    WAITING_BLACKLIST,      # 17
+    WAITING_WHITELIST,      # 18
+    WAITING_DELAY,          # 19
+    WAITING_BEGIN_TEXT,     # 20
+    WAITING_END_TEXT,       # 21
+    WAITING_FILTER_USERS,   # 22
+    WAITING_REMOVE_ROUTE,   # 23
+    WAITING_REMOVE_FILTER,  # 24
+    WAITING_REM_BLACKLIST,  # 25
+    WAITING_REM_WHITELIST,  # 26
+) = range(27)
 
 # ─────────────────────────────────────────────
 #  Global userbot reference
@@ -108,10 +123,11 @@ userbot_client: Optional[TelegramClient] = None
 forward_task:   Optional[asyncio.Task]   = None
 
 # ── Auto-Forward globals ──────────────────────────────────────────
-auto_forward_handler = None          # registered Telethon event handler fn
+auto_forward_handler = None          # registered Telethon event handler fn (legacy)
 auto_forward_task_user: Optional[int] = None  # user who owns the active watch
 _pending_albums: Dict[int, List]    = {}      # grouped_id → [Message, ...]
 _album_tasks:   Dict[int, asyncio.Task] = {}  # grouped_id → flush Task
+_route_handlers: Dict[str, Any]     = {}      # source_channel → handler fn (route mode)
 
 # ─────────────────────────────────────────────
 #  DC address table  (for Pyrogram → Telethon conversion)
@@ -1646,8 +1662,9 @@ async def _safe_send(
     dest,
     msg=None,
     album: Optional[List] = None,
+    caption: Optional[str] = None,
     retries: int = 3,
-) -> bool:
+) -> Any:
     """
     Copy a single message or album to dest without a Forwarded-from tag.
     Preserves: media, captions, text formatting entities, stickers, documents.
@@ -1667,12 +1684,18 @@ async def _safe_send(
                     if not valid:
                         logger.warning("Album has no valid media")
                         return True     # nothing to send
-                    # Use the first message's text as caption
-                    caption = next((m.message for m in valid if m.message), "")
-                    # FIX: pass caption_entities for proper formatting on albums
-                    caption_entities = next(
-                        (m.entities for m in valid if m.message and m.entities), None
-                    )
+                    
+                    # Use the first message's text as caption if not overridden
+                    if caption is None:
+                        send_caption = next((m.message for m in valid if m.message), "")
+                        caption_entities = next(
+                            (m.entities for m in valid if m.message and m.entities), None
+                        )
+                        parse_mode = None
+                    else:
+                        send_caption = caption
+                        caption_entities = None
+                        parse_mode = 'md'
                     
                     # ── FIX: Download and re-upload media for restricted channels ──
                     file_paths = []
@@ -1716,20 +1739,22 @@ async def _safe_send(
                         
                         if file_paths:
                             logger.info(f"Sending album with {len(file_paths)} media files...")
-                            await client.send_file(
+                            sent_msgs = await client.send_file(
                                 dest,
                                 file_paths,
-                                caption=caption,
+                                caption=send_caption,
                                 formatting_entities=caption_entities,
+                                parse_mode=parse_mode,
                             )
                             logger.info("✓ Album sent successfully")
-                        return True
+                            return sent_msgs
+                        return None
                     except Exception as send_exc:
                         logger.error(f"Album send failed: {type(send_exc).__name__}: {send_exc}")
                         raise
 
                 if msg is None:
-                    return True
+                    return None
 
                 # ── Media (photo, video, doc, audio, sticker, …) ────
                 if msg.media:
@@ -1783,32 +1808,41 @@ async def _safe_send(
                     
                     try:
                         logger.info(f"Sending file: {file_to_send}")
-                        await client.send_file(
+                        send_caption = caption if caption is not None else (msg.message or "")
+                        caption_entities = None if caption is not None else (msg.entities if msg.entities else None)
+                        parse_mode = 'md' if caption is not None else None
+                        
+                        sent = await client.send_file(
                             dest,
                             file_to_send,
-                            caption=msg.message or "",
-                            # FIX: pass entities so bold/italic/links survive on captions
-                            formatting_entities=msg.entities if msg.entities else None,
+                            caption=send_caption,
+                            formatting_entities=caption_entities,
+                            parse_mode=parse_mode,
                         )
                         logger.info("✓ Media sent successfully")
-                        return True
+                        return sent
                     except Exception as send_exc:
                         logger.error(f"send_file failed: {type(send_exc).__name__}: {send_exc}")
                         raise
 
                 # ── Plain text ────────────────────────────────────────
-                if msg.message:
+                if msg.message or caption is not None:
                     logger.info("Sending text message")
-                    await client.send_message(
+                    send_text = caption if caption is not None else msg.message
+                    caption_entities = None if caption is not None else (msg.entities if msg.entities else None)
+                    parse_mode = 'md' if caption is not None else None
+                    
+                    sent = await client.send_message(
                         dest,
-                        msg.message,
-                        formatting_entities=msg.entities if msg.entities else None,
+                        send_text,
+                        formatting_entities=caption_entities,
+                        parse_mode=parse_mode,
                     )
                     logger.info("✓ Text sent successfully")
-                    return True
+                    return sent
 
                 logger.warning("Message has no media or text")
-                return True  # empty — skip silently
+                return None  # empty — skip silently
 
             except FloodWaitError as fwe:
                 wait = fwe.seconds + 3
@@ -1821,7 +1855,7 @@ async def _safe_send(
                     await asyncio.sleep(2 ** attempt)
 
         logger.error("All retry attempts failed")
-        return False
+        return None
     
     finally:
         # ── CLEANUP: Delete downloaded files after sending ──
@@ -1839,13 +1873,94 @@ async def _safe_send(
 
 
 # ═══════════════════════════════════════════════════════
+#  FILTER PIPELINE HELPERS
+# ═══════════════════════════════════════════════════════
+
+def _passes_filters(user_id: int, text: str, sender_id: Optional[int]) -> bool:
+    """
+    Returns True if the message should be forwarded.
+    Priority: user_filter → blacklist → whitelist.
+    """
+    # User-filter: only allow specific senders (if list is non-empty)
+    user_filters = db.get_user_filters(user_id)
+    if user_filters and sender_id not in user_filters:
+        logger.debug(f"Message from {sender_id} dropped by user_filter.")
+        return False
+
+    content = (text or "").lower()
+
+    # Blacklist: drop if any keyword found
+    for kw in db.get_blacklist(user_id):
+        if kw in content:
+            logger.debug(f"Message dropped by blacklist keyword '{kw}'.")
+            return False
+
+    # Whitelist: drop if no keyword found (only enforced when list is non-empty)
+    whitelist = db.get_whitelist(user_id)
+    if whitelist and not any(kw in content for kw in whitelist):
+        logger.debug("Message dropped: no whitelist keyword found.")
+        return False
+
+    return True
+
+
+def _apply_text_filters(user_id: int, text: str) -> str:
+    """Apply text-replacement filters and [mono] formatting."""
+    if not text:
+        return text
+    result = text
+    for f in db.get_filters(user_id):
+        pattern     = f["pattern"]
+        replacement = f["replacement"]
+        if f.get("is_regex"):
+            try:
+                result = re.sub(pattern, replacement, result)
+            except re.error as exc:
+                logger.warning(f"Regex filter error '{pattern}': {exc}")
+        else:
+            result = result.replace(pattern, replacement)
+    # [mono]text[/mono] → `text`
+    result = re.sub(r"\[mono\](.*?)\[/mono\]", r"`\1`", result, flags=re.DOTALL)
+    return result
+
+
+def _apply_placeholders(text: str, sender) -> str:
+    """Replace [user.X] placeholders with live user info."""
+    if not text or not sender:
+        return text
+    username   = getattr(sender, "username", None) or ""
+    uid        = str(getattr(sender, "id", ""))
+    first_name = getattr(sender, "first_name", "") or ""
+    last_name  = getattr(sender, "last_name", "")  or ""
+    text = text.replace("[user.username]",          f"@{username}" if username else uid)
+    text = text.replace("[user.id]",                uid)
+    text = text.replace("[user.first_name]",        first_name)
+    text = text.replace("[user.last_name]",         last_name)
+    text = text.replace("[user.username | user.id]", f"@{username}" if username else uid)
+    return text
+
+
+async def _build_caption(user_id: int, original_text: str, sender,
+                         cfg: Dict) -> str:
+    """Assemble the final caption: filters → placeholders → begin/end text."""
+    text = _apply_text_filters(user_id, original_text)
+    text = _apply_placeholders(text, sender)
+    if cfg.get("begin_text"):
+        text = cfg["begin_text"] + ("\n" if text else "") + text
+    if cfg.get("end_text"):
+        text = text + ("\n" if text else "") + cfg["end_text"]
+    return text
+
+
+# ═══════════════════════════════════════════════════════
 #  AUTO-FORWARD ENGINE  (real-time /watch feature)
 # ═══════════════════════════════════════════════════════
 
-async def _flush_album(grouped_id: int, client: TelegramClient, user_id: int):
+async def _flush_album(grouped_id: int, client: TelegramClient, user_id: int,
+                       destinations: List[str], source_str: str):
     """
-    Wait briefly (1.5 s) then send all collected album parts to destinations.
-    The delay lets every part of the media group arrive before we upload.
+    Wait 1.5 s, then send all batched album parts to destinations.
+    Applies the filter pipeline to the album caption.
     """
     await asyncio.sleep(1.5)
     album = _pending_albums.pop(grouped_id, [])
@@ -1853,26 +1968,53 @@ async def _flush_album(grouped_id: int, client: TelegramClient, user_id: int):
     if not album:
         return
     album.sort(key=lambda m: m.id)
-    destinations = db.get_destination_channel_ids(user_id)
+
+    cfg = db.get_config(user_id)
+    if not cfg.get("media_enabled", True):
+        return
+
+    # Build caption from the first message that has text
+    first_text = next((m.message for m in album if m.message), "") or ""
+    sender = None
+    try:
+        sender = await client.get_entity(album[0].sender_id)
+    except Exception:
+        pass
+    caption = await _build_caption(user_id, first_text, sender, cfg)
+
     for dest_str in destinations:
         try:
             dest_entity = await client.get_entity(_parse_channel(dest_str))
-            await _safe_send(client, dest_entity, album=album)
+            await _safe_send(client, dest_entity, album=album, caption=caption)
         except Exception as exc:
             logger.error(f"Auto-forward album → {dest_str} failed: {exc}")
 
 
 def _stop_auto_forward(client: Optional[TelegramClient] = None):
-    """Remove the registered NewMessage event handler (if any)."""
-    global auto_forward_handler, auto_forward_task_user
+    """Remove all registered NewMessage/edit/delete event handlers."""
+    global auto_forward_handler, auto_forward_task_user, _route_handlers
+
+    # Remove legacy single-handler
     if client and auto_forward_handler:
         try:
             client.remove_event_handler(auto_forward_handler)
-            logger.info("Auto-forward event handler removed.")
+            logger.info("Auto-forward legacy handler removed.")
         except Exception as exc:
-            logger.warning(f"Could not remove auto-forward handler: {exc}")
-    auto_forward_handler    = None
-    auto_forward_task_user  = None
+            logger.warning(f"Could not remove legacy handler: {exc}")
+    auto_forward_handler = None
+
+    # Remove all route-based handlers
+    if client:
+        for src, handler in list(_route_handlers.items()):
+            try:
+                client.remove_event_handler(handler)
+                logger.info(f"Route handler removed for source: {src}")
+            except Exception as exc:
+                logger.warning(f"Could not remove route handler ({src}): {exc}")
+    _route_handlers.clear()
+
+    auto_forward_task_user = None
+
     # Cancel pending album timers
     for task in list(_album_tasks.values()):
         task.cancel()
@@ -1880,82 +2022,276 @@ def _stop_auto_forward(client: Optional[TelegramClient] = None):
     _pending_albums.clear()
 
 
-async def _start_auto_forward(user_id: int, source_channel: str) -> bool:
+def _make_message_handler(client: TelegramClient, user_id: int,
+                          source_str: str, get_dests_fn):
     """
-    Register a Telethon NewMessage handler on source_channel.
-    Every new message (or album) is instantly forwarded to the user's
-    destination channels using _safe_send() — no forward tag, full media.
-
-    Returns True if the handler was registered successfully.
+    Factory that returns a NewMessage handler coroutine.
+    get_dests_fn() is called at runtime to get fresh destination list.
     """
-    global auto_forward_handler, auto_forward_task_user
-
-    client = await get_userbot(user_id)
-    if not client:
-        logger.error("_start_auto_forward: no live userbot client.")
-        return False
-
-    # Remove any existing handler first
-    _stop_auto_forward(client)
-
-    try:
-        source_entity = await client.get_entity(_parse_channel(source_channel))
-    except Exception as exc:
-        logger.error(f"_start_auto_forward: cannot resolve '{source_channel}': {exc}")
-        return False
-
-    # Inner handler — runs in Telethon's event loop for every new message
     async def _on_new_message(event):
         try:
             msg = event.message
             if not msg or isinstance(msg, MessageEmpty):
                 return
 
-            destinations = db.get_destination_channel_ids(user_id)
+            # Get sender for filtering/placeholders
+            sender = None
+            sender_id = None
+            try:
+                sender = await event.get_sender()
+                sender_id = sender.id if sender else None
+            except Exception:
+                pass
+
+            text = msg.message or ""
+
+            # ── Filter pipeline ─────────────────────────────────────
+            if not _passes_filters(user_id, text, sender_id):
+                return
+
+            cfg = db.get_config(user_id)
+
+            # ── Media / text toggle ─────────────────────────────────
+            has_media = msg.media is not None
+            if has_media and not cfg.get("media_enabled", True):
+                return
+            if not has_media and not cfg.get("text_enabled", True):
+                return
+
+            # ── Delay ───────────────────────────────────────────────
+            delay = cfg.get("delay", 0)
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+            # ── Get destinations ────────────────────────────────────
+            destinations = get_dests_fn()
             if not destinations:
                 return
 
             grouped_id = getattr(msg, "grouped_id", None)
 
             if grouped_id:
-                # ── Album: batch parts, flush after 1.5 s ──────────
+                # Album: batch parts, flush after 1.5 s
                 if grouped_id not in _pending_albums:
                     _pending_albums[grouped_id] = []
                 _pending_albums[grouped_id].append(msg)
-
-                # Reset flush timer on every new part
                 existing = _album_tasks.get(grouped_id)
                 if existing and not existing.done():
                     existing.cancel()
                 _album_tasks[grouped_id] = asyncio.create_task(
-                    _flush_album(grouped_id, client, user_id)
+                    _flush_album(grouped_id, client, user_id, destinations, source_str)
                 )
             else:
-                # ── Single message: forward immediately ────────────
+                # Single message
+                final_caption = await _build_caption(user_id, text, sender, cfg)
+
                 for dest_str in destinations:
                     try:
                         dest_entity = await client.get_entity(_parse_channel(dest_str))
-                        await _safe_send(client, dest_entity, msg=msg)
+
+                        if cfg.get("copy_mode", True):
+                            # Copy mode: download & re-upload (no forward tag)
+                            if has_media:
+                                # Override caption via dedicated send
+                                sent = await _safe_send(client, dest_entity, msg=msg, caption=final_caption)
+                            else:
+                                # Text-only — use modified caption
+                                no_preview = not cfg.get("url_preview", False)
+                                sent = await client.send_message(
+                                    dest_entity,
+                                    final_caption or msg.message,
+                                    link_preview=not no_preview,
+                                )
+                        else:
+                            # Native forward mode (shows "Forwarded from" tag)
+                            sent = await client.forward_messages(dest_entity, msg)
+
+                        # ── Edit/Delete sync: store mapping ─────────────
+                        cfg_sync = cfg.get("edit_sync") or cfg.get("delete_sync")
+                        if cfg_sync:
+                            try:
+                                sent_id = sent.id if hasattr(sent, "id") else None
+                                if sent_id:
+                                    db.save_message_mapping(
+                                        user_id, source_str, msg.id, dest_str, sent_id
+                                    )
+                            except Exception:
+                                pass
+
                     except Exception as exc:
                         logger.error(f"Auto-forward → {dest_str} failed: {exc}")
 
         except Exception as exc:
             logger.exception(f"_on_new_message error: {exc}")
 
-    # Register the handler scoped to the source entity
-    client.add_event_handler(
-        _on_new_message,
-        telethon_events.NewMessage(chats=source_entity),
-    )
+    return _on_new_message
 
-    auto_forward_handler   = _on_new_message
-    auto_forward_task_user = user_id
 
-    # Persist active state
-    db.set_watch_active(user_id, True)
+def _make_edit_handler(client: TelegramClient, user_id: int, source_str: str):
+    """Handler for edited messages — updates forwarded copies."""
+    async def _on_edit(event):
+        try:
+            cfg = db.get_config(user_id)
+            if not cfg.get("edit_sync"):
+                return
+            msg = event.message
+            if not msg:
+                return
+            mappings = db.get_message_mappings(user_id, source_str, msg.id)
+            if not mappings:
+                return
+            new_text = msg.message or ""
+            sender = None
+            try:
+                sender = await event.get_sender()
+            except Exception:
+                pass
+            final = await _build_caption(user_id, new_text, sender, cfg)
+            for m in mappings:
+                try:
+                    dest_entity = await client.get_entity(_parse_channel(m["dest_chat"]))
+                    await client.edit_message(dest_entity, m["dest_msg_id"], final)
+                except Exception as exc:
+                    logger.warning(f"Edit sync failed for {m['dest_chat']}: {exc}")
+        except Exception as exc:
+            logger.exception(f"_on_edit error: {exc}")
+    return _on_edit
 
-    logger.info(f"Auto-forward STARTED: '{source_channel}' → user {user_id}'s destinations")
-    return True
+
+def _make_delete_handler(client: TelegramClient, user_id: int, source_str: str):
+    """Handler for deleted messages — deletes forwarded copies."""
+    async def _on_delete(event):
+        try:
+            cfg = db.get_config(user_id)
+            if not cfg.get("delete_sync"):
+                return
+            for msg_id in event.deleted_ids:
+                mappings = db.get_message_mappings(user_id, source_str, msg_id)
+                for m in mappings:
+                    try:
+                        dest_entity = await client.get_entity(_parse_channel(m["dest_chat"]))
+                        await client.delete_messages(dest_entity, [m["dest_msg_id"]])
+                    except Exception as exc:
+                        logger.warning(f"Delete sync failed for {m['dest_chat']}: {exc}")
+                db.delete_message_mappings(user_id, source_str, msg_id)
+        except Exception as exc:
+            logger.exception(f"_on_delete error: {exc}")
+    return _on_delete
+
+
+async def _start_auto_forward(user_id: int, source_channel: str = None) -> bool:
+    """
+    Route-aware auto-forward launcher.
+
+    • If user has active routes  → register one Telethon handler per unique source.
+    • Otherwise (legacy mode)   → register one handler for source_channel and
+                                   forward to all destination_channels (old behavior).
+
+    Always falls back gracefully so existing users are unaffected.
+    Returns True if at least one handler was registered.
+    """
+    global auto_forward_handler, auto_forward_task_user, _route_handlers
+
+    client = await get_userbot(user_id)
+    if not client:
+        logger.error("_start_auto_forward: no live userbot client.")
+        return False
+
+    _stop_auto_forward(client)   # clean slate
+
+    routes = db.get_routes(user_id)
+
+    if routes:
+        # ── Route-based mode ─────────────────────────────────────
+        unique_sources = db.get_unique_active_sources(user_id)
+        registered = 0
+
+        for src in unique_sources:
+            try:
+                src_entity = await client.get_entity(_parse_channel(src))
+
+                # Capture src in closure
+                def make_get_dests(s):
+                    return lambda: db.get_destinations_for_source(user_id, s)
+
+                msg_handler = _make_message_handler(
+                    client, user_id, src, make_get_dests(src)
+                )
+                edit_handler   = _make_edit_handler(client, user_id, src)
+                delete_handler = _make_delete_handler(client, user_id, src)
+
+                client.add_event_handler(
+                    msg_handler,
+                    telethon_events.NewMessage(chats=src_entity),
+                )
+                client.add_event_handler(
+                    edit_handler,
+                    telethon_events.MessageEdited(chats=src_entity),
+                )
+                client.add_event_handler(
+                    delete_handler,
+                    telethon_events.MessageDeleted(chats=src_entity),
+                )
+                _route_handlers[src] = msg_handler
+                registered += 1
+                logger.info(f"Route handler registered: {src}")
+            except Exception as exc:
+                logger.error(f"Cannot register route handler for '{src}': {exc}")
+
+        if registered > 0:
+            auto_forward_task_user = user_id
+            db.set_watch_active(user_id, True)
+            logger.info(
+                f"Route-based auto-forward STARTED for user {user_id} "
+                f"({registered}/{len(unique_sources)} sources active)"
+            )
+            return True
+        return False
+
+    else:
+        # ── Legacy mode (no routes) ───────────────────────────────
+        legacy_source = source_channel
+        if not legacy_source:
+            cfg = db.get_watch_config(user_id)
+            if cfg:
+                legacy_source = cfg.get("source_channel")
+        if not legacy_source:
+            return False
+
+        try:
+            src_entity = await client.get_entity(_parse_channel(legacy_source))
+        except Exception as exc:
+            logger.error(f"Legacy mode: cannot resolve '{legacy_source}': {exc}")
+            return False
+
+        def legacy_get_dests():
+            return db.get_destination_channel_ids(user_id)
+
+        handler = _make_message_handler(
+            client, user_id, legacy_source, legacy_get_dests
+        )
+        edit_handler   = _make_edit_handler(client, user_id, legacy_source)
+        delete_handler = _make_delete_handler(client, user_id, legacy_source)
+
+        client.add_event_handler(
+            handler,
+            telethon_events.NewMessage(chats=src_entity),
+        )
+        client.add_event_handler(
+            edit_handler,
+            telethon_events.MessageEdited(chats=src_entity),
+        )
+        client.add_event_handler(
+            delete_handler,
+            telethon_events.MessageDeleted(chats=src_entity),
+        )
+
+        auto_forward_handler   = handler
+        auto_forward_task_user = user_id
+        db.set_watch_active(user_id, True)
+
+        logger.info(f"Legacy auto-forward STARTED: '{legacy_source}' → user {user_id}'s destinations")
+        return True
 
 
 # ═══════════════════════════════════════════════════════
@@ -1963,26 +2299,61 @@ async def _start_auto_forward(user_id: int, source_channel: str) -> bool:
 # ═══════════════════════════════════════════════════════
 
 async def watch_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Entry point for /watch — asks for the source channel to monitor."""
+    """Start auto-forwarding. Uses routes if configured, else asks for source."""
     user_id = update.effective_user.id
 
     if not db.get_session(user_id):
         await update.message.reply_text("❌ Userbot not logged in. Use /login first.")
         return ConversationHandler.END
 
+    routes = db.get_routes(user_id)
+
+    # ── Route mode: start immediately ────────────────────────────
+    if routes:
+        if not db.get_destination_channel_ids(user_id) and \
+                not db.get_unique_active_sources(user_id):
+            await update.message.reply_text(
+                "❌ No routes configured. Use /add_route to create one first."
+            )
+            return ConversationHandler.END
+
+        msg = await update.message.reply_text("⏳ Starting route-based forwarding…")
+        ok = await _start_auto_forward(user_id)
+        if ok:
+            sources = db.get_unique_active_sources(user_id)
+            await msg.edit_text(
+                "✅ *Forwarding started.*\n\n"
+                "🔴 Monitoring all configured routes.\n\n"
+                f"📡 Sources: `{len(sources)}`\n"
+                f"🗺 Routes: `{len(routes)}`\n\n"
+                "Use /routes to see all routes.\n"
+                "Use /unwatch to stop.",
+                parse_mode="Markdown",
+            )
+        else:
+            await msg.edit_text(
+                "❌ Failed to start forwarding.\n"
+                "Verify that the userbot has access to all source channels."
+            )
+        return ConversationHandler.END
+
+    # ── Legacy mode: no routes → ask for source channel ──────────
     if not db.get_destination_channel_ids(user_id):
-        await update.message.reply_text("❌ No destination channels set. Add one via /settings.")
+        await update.message.reply_text(
+            "❌ No destination channels set.\n"
+            "Add one via /settings, or set up routes with /add_route."
+        )
         return ConversationHandler.END
 
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_conv")]])
     await update.message.reply_text(
         "🔴 *Auto-Forward Setup*\n\n"
-        "Send the *source channel* to watch for new messages.\n\n"
-        "Accepted formats:\n"
+        "You have no routes configured yet.\n\n"
+        "Send the *source channel* to watch for new messages:\n\n"
         "• `@username`\n"
         "• `-1001234567890`\n"
         "• `https://t.me/channelname`\n\n"
-        "_The userbot must have joined (or be an admin of) this channel._",
+        "💡 _Tip: Use /add_route to set up named route mappings._",
         parse_mode="Markdown",
         reply_markup=kb,
     )
@@ -1990,7 +2361,7 @@ async def watch_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def receive_watch_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Validate source channel, start the auto-forward handler, save to DB."""
+    """Legacy mode: validate source channel and start watching."""
     user_id = update.effective_user.id
     raw     = (update.message.text or "").strip()
 
@@ -2008,7 +2379,6 @@ async def receive_watch_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     source = normalise_channel(raw)
     msg    = await update.message.reply_text(f"⏳ Connecting to `{source}`…", parse_mode="Markdown")
 
-    # Save config first so restart-recovery works even if the next step is slow
     db.save_watch_config(user_id, source)
 
     ok = await _start_auto_forward(user_id, source)
@@ -2022,7 +2392,7 @@ async def receive_watch_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     await msg.edit_text(
-        f"✅ *Auto-forward active!*\n\n"
+        "✅ *Forwarding started.*\n\n"
         f"🔴 Watching: `{source}`\n"
         f"📤 Destinations: {len(db.get_destination_channel_ids(user_id))} channel(s)\n\n"
         "Every new message will be instantly forwarded.\n"
@@ -2037,22 +2407,37 @@ async def receive_watch_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════
 
 async def unwatch_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Stop auto-forwarding and clear the watch config."""
+    """Stop auto-forwarding. Routes and settings remain saved."""
     user_id = update.effective_user.id
     global userbot_client
 
+    routes = db.get_routes(user_id)
     watch_cfg = db.get_watch_config(user_id)
-    if not watch_cfg or not watch_cfg.get("is_active"):
-        await update.message.reply_text("⏹ Auto-forward is not currently active.")
+
+    is_active = (
+        auto_forward_task_user == user_id
+        and (bool(_route_handlers) or auto_forward_handler is not None)
+    )
+
+    if not is_active:
+        await update.message.reply_text(
+            "⏹ Forwarding is not currently active.\n\n"
+            "Use /watch to start."
+        )
         return
 
     _stop_auto_forward(userbot_client)
     db.set_watch_active(user_id, False)
 
-    source = watch_cfg.get("source_channel", "unknown")
+    if routes:
+        source_info = f"{len(routes)} route(s)"
+    else:
+        source_info = (watch_cfg or {}).get("source_channel", "unknown")
+
     await update.message.reply_text(
-        f"⏹ *Auto-forward stopped.*\n\n"
-        f"Was watching: `{source}`\n\n"
+        "⏹ *Forwarding stopped.*\n\n"
+        f"Was watching: `{source_info}`\n\n"
+        "Your routes and settings remain saved.\n"
         "Use /watch to start again.",
         parse_mode="Markdown",
     )
@@ -2341,6 +2726,940 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # Handled inside save_conv — this fallback fires if somehow triggered outside
         return await bulk_save_start(update, ctx)
 
+    elif d == "confirm_reset_config":
+        user_id = query.from_user.id
+        db.reset_config(user_id)
+        await query.edit_message_text(
+            "✅ *Configuration reset to defaults.*\n\n"
+            "Routes, sources, destinations, filters, blacklist, and whitelist are unchanged.\n"
+            "Use /config to review your current settings.",
+            parse_mode="Markdown",
+        )
+
+    elif d == "confirm_delete_all":
+        user_id = query.from_user.id
+        global userbot_client
+        _stop_auto_forward(userbot_client)
+        if userbot_client:
+            try:
+                await userbot_client.disconnect()
+            except Exception:
+                pass
+            userbot_client = None
+        db.delete_all_user_data(user_id)
+        await query.edit_message_text(
+            "✅ *All your data has been deleted.*\n\n"
+            "Session, routes, settings — everything has been removed.\n"
+            "Use /start to begin fresh.",
+            parse_mode="Markdown",
+        )
+
+
+
+
+# ═══════════════════════════════════════════════════════
+#  /incoming — Add Source Channel
+# ═══════════════════════════════════════════════════════
+
+async def incoming_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Start flow to add a source channel."""
+    user_id = update.effective_user.id
+    db.add_user(user_id, update.effective_user.first_name,
+                update.effective_user.last_name or "")
+
+    sources = db.get_source_channels(user_id)
+    lines   = "\n".join(f"• `{s['channel_id']}`" for s in sources) if sources else "_None added yet_"
+
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_conv")]])
+    await update.message.reply_text(
+        "📥 *Incoming (Source Channels)*\n\n"
+        f"*Current sources:*\n{lines}\n\n"
+        "Send the source channel you want to monitor:\n\n"
+        "• `@username`\n"
+        "• `-1001234567890`\n"
+        "• `https://t.me/channelname`",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+    return WAITING_INCOMING
+
+
+async def receive_incoming(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    raw     = (update.message.text or "").strip()
+
+    if not validate_channel_format(raw):
+        await update.message.reply_text(
+            "❌ Invalid format. Send `@username`, `-100ID`, or a `t.me/` link.",
+            parse_mode="Markdown",
+        )
+        return WAITING_INCOMING
+
+    channel = normalise_channel(raw)
+    sources = db.get_source_channel_ids(user_id)
+
+    if channel in sources:
+        await update.message.reply_text(
+            f"⚠️ `{channel}` is already in your source list.",
+            parse_mode="Markdown",
+        )
+        return ConversationHandler.END
+
+    db.add_source_channel(user_id, channel)
+    total = len(db.get_source_channels(user_id))
+    await update.message.reply_text(
+        f"✅ *Source added:* `{channel}`\n\n"
+        f"Total sources: {total}\n\n"
+        "Now use /add_route to map this source to a destination.",
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END
+
+
+# ═══════════════════════════════════════════════════════
+#  /outgoing — Add Destination Channel (route system)
+# ═══════════════════════════════════════════════════════
+
+async def outgoing_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Add a destination channel for the route system."""
+    user_id = update.effective_user.id
+    db.add_user(user_id, update.effective_user.first_name,
+                update.effective_user.last_name or "")
+
+    dests = db.get_destination_channels(user_id)
+    lines = "\n".join(f"• `{d['channel_id']}`" for d in dests) if dests else "_None added yet_"
+
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_conv")]])
+    await update.message.reply_text(
+        "📤 *Outgoing (Destination Channels)*\n\n"
+        f"*Current destinations:*\n{lines}\n\n"
+        "Send the destination channel where messages should be forwarded:\n\n"
+        "• `@username`\n"
+        "• `-1001234567890`\n"
+        "• `https://t.me/channelname`",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+    return WAITING_OUTGOING
+
+
+async def receive_outgoing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    raw     = (update.message.text or "").strip()
+
+    if not validate_channel_format(raw):
+        await update.message.reply_text(
+            "❌ Invalid format. Send `@username`, `-100ID`, or a `t.me/` link.",
+            parse_mode="Markdown",
+        )
+        return WAITING_OUTGOING
+
+    channel = normalise_channel(raw)
+    existing = db.get_destination_channel_ids(user_id)
+
+    if channel in existing:
+        await update.message.reply_text(
+            f"⚠️ `{channel}` is already in your destinations.",
+            parse_mode="Markdown",
+        )
+        return ConversationHandler.END
+
+    db.add_user(user_id, update.effective_user.first_name,
+                update.effective_user.last_name or "")
+    db.add_destination_channel(user_id, channel)
+    total = len(db.get_destination_channels(user_id))
+    await update.message.reply_text(
+        f"✅ *Destination added:* `{channel}`\n\n"
+        f"Total destinations: {total}\n\n"
+        "Use /add_route to map a source to this destination.",
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END
+
+
+# ═══════════════════════════════════════════════════════
+#  /routes — List All Routes
+# ═══════════════════════════════════════════════════════
+
+async def routes_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    routes  = db.get_routes(user_id)
+
+    if not routes:
+        await update.message.reply_text(
+            "🗺 *Configured Routes*\n\n"
+            "_No routes configured yet._\n\n"
+            "Use /add_route to create one.",
+            parse_mode="Markdown",
+        )
+        return
+
+    lines = "\n".join(
+        f"`{i + 1}.` `{r['source']}` → `{r['destination']}`"
+        for i, r in enumerate(routes)
+    )
+    await update.message.reply_text(
+        f"🗺 *Configured Routes* ({len(routes)})\n\n"
+        f"{lines}\n\n"
+        "Use /add_route to add • /remove_route to delete • /watch to start",
+        parse_mode="Markdown",
+    )
+
+
+# ═══════════════════════════════════════════════════════
+#  /add_route — Create a Route (2-step conversation)
+# ═══════════════════════════════════════════════════════
+
+async def add_route_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    db.add_user(user_id, update.effective_user.first_name,
+                update.effective_user.last_name or "")
+
+    sources = db.get_source_channels(user_id)
+    dests   = db.get_destination_channels(user_id)
+
+    if not sources and not dests:
+        await update.message.reply_text(
+            "⚠️ *No sources or destinations found.*\n\n"
+            "Run /incoming to add a source channel first,\n"
+            "then /outgoing to add a destination.",
+            parse_mode="Markdown",
+        )
+
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_conv")]])
+    await update.message.reply_text(
+        "➕ *Add Route — Step 1/2*\n\n"
+        "Send the *source channel* (messages will be read from here):\n\n"
+        "• `@username`\n"
+        "• `-1001234567890`\n"
+        "• `https://t.me/channelname`",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+    return WAITING_ADD_ROUTE_SRC
+
+
+async def receive_add_route_src(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    raw = (update.message.text or "").strip()
+    if not validate_channel_format(raw):
+        await update.message.reply_text(
+            "❌ Invalid format. Send `@username`, `-100ID`, or `t.me/` link.",
+            parse_mode="Markdown",
+        )
+        return WAITING_ADD_ROUTE_SRC
+
+    ctx.user_data["route_src"] = normalise_channel(raw)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_conv")]])
+    await update.message.reply_text(
+        "➕ *Add Route — Step 2/2*\n\n"
+        f"Source: `{ctx.user_data['route_src']}`\n\n"
+        "Now send the *destination channel* (messages will be sent here):\n\n"
+        "• `@username`\n"
+        "• `-1001234567890`\n"
+        "• `https://t.me/channelname`",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+    return WAITING_ADD_ROUTE_DST
+
+
+async def receive_add_route_dst(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    raw     = (update.message.text or "").strip()
+
+    if not validate_channel_format(raw):
+        await update.message.reply_text(
+            "❌ Invalid format. Send `@username`, `-100ID`, or `t.me/` link.",
+            parse_mode="Markdown",
+        )
+        return WAITING_ADD_ROUTE_DST
+
+    src = ctx.user_data.get("route_src", "")
+    dst = normalise_channel(raw)
+
+    if src == dst:
+        await update.message.reply_text("❌ Source and destination cannot be the same channel.")
+        return WAITING_ADD_ROUTE_DST
+
+    ok = db.add_route(user_id, src, dst)
+    if not ok:
+        await update.message.reply_text(
+            f"⚠️ Route `{src}` → `{dst}` already exists.",
+            parse_mode="Markdown",
+        )
+        return ConversationHandler.END
+
+    # Auto-register source and destination
+    db.add_source_channel(user_id, src)
+    db.add_user(user_id, update.effective_user.first_name,
+                update.effective_user.last_name or "")
+    db.add_destination_channel(user_id, dst)
+
+    routes = db.get_routes(user_id)
+    await update.message.reply_text(
+        f"✅ *Route created!*\n\n"
+        f"`{src}` → `{dst}`\n\n"
+        f"Total routes: {len(routes)}\n\n"
+        "Run /watch to start forwarding.",
+        parse_mode="Markdown",
+    )
+    ctx.user_data.pop("route_src", None)
+    return ConversationHandler.END
+
+
+# ═══════════════════════════════════════════════════════
+#  /remove_route — Delete a Route
+# ═══════════════════════════════════════════════════════
+
+async def remove_route_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    routes  = db.get_routes(user_id)
+
+    if not routes:
+        await update.message.reply_text("❌ No routes to remove. Use /add_route first.")
+        return ConversationHandler.END
+
+    lines = "\n".join(
+        f"`{i + 1}.` `{r['source']}` → `{r['destination']}`"
+        for i, r in enumerate(routes)
+    )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_conv")]])
+    await update.message.reply_text(
+        f"🗑 *Remove Route*\n\n{lines}\n\n"
+        "Send the *number* of the route to remove:",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+    return WAITING_REMOVE_ROUTE
+
+
+async def receive_remove_route(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    raw     = (update.message.text or "").strip()
+    try:
+        idx = int(raw) - 1
+    except ValueError:
+        await update.message.reply_text("❌ Please send a valid number.")
+        return WAITING_REMOVE_ROUTE
+
+    ok = db.remove_route_by_index(user_id, idx)
+    if ok:
+        remaining = db.get_routes(user_id)
+        await update.message.reply_text(
+            f"✅ Route removed. Remaining routes: {len(remaining)}",
+        )
+    else:
+        await update.message.reply_text("❌ Invalid number. Use /remove_route to try again.")
+    return ConversationHandler.END
+
+
+# ═══════════════════════════════════════════════════════
+#  /filter — Add Text Replacement Filter
+# ═══════════════════════════════════════════════════════
+
+async def filter_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    filters = db.get_filters(user_id)
+    lines   = "\n".join(
+        f"`{i+1}.` `{f['pattern']}` → `{f['replacement']}`"
+        + (" _(regex)_" if f.get("is_regex") else "")
+        for i, f in enumerate(filters)
+    ) if filters else "_No filters yet_"
+
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_conv")]])
+    await update.message.reply_text(
+        "🔤 *Text Replacement Filters*\n\n"
+        f"*Current filters:*\n{lines}\n\n"
+        "Send a replacement rule in one of these formats:\n\n"
+        "Plain: `old text ==> new text`\n"
+        "Regex: `re:pattern ==> replacement`\n\n"
+        "_Supports [mono]text[/mono] formatting._",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+    return WAITING_FILTER
+
+
+async def receive_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    raw     = (update.message.text or "").strip()
+
+    if "==>" not in raw:
+        await update.message.reply_text(
+            "❌ Invalid format. Use: `old ==> new` or `re:pattern ==> replacement`",
+            parse_mode="Markdown",
+        )
+        return WAITING_FILTER
+
+    parts       = raw.split("==>", 1)
+    pattern_raw = parts[0].strip()
+    replacement = parts[1].strip()
+    is_regex    = False
+
+    if pattern_raw.startswith("re:"):
+        pattern_raw = pattern_raw[3:].strip()
+        is_regex    = True
+        try:
+            re.compile(pattern_raw)
+        except re.error as exc:
+            await update.message.reply_text(f"❌ Invalid regex: `{exc}`", parse_mode="Markdown")
+            return WAITING_FILTER
+
+    db.add_filter(user_id, pattern_raw, replacement, is_regex)
+    await update.message.reply_text(
+        f"✅ Filter added:\n`{pattern_raw}` → `{replacement}`"
+        + (" _(regex)_" if is_regex else ""),
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END
+
+
+# ═══════════════════════════════════════════════════════
+#  /remove_filter — Remove a Filter
+# ═══════════════════════════════════════════════════════
+
+async def remove_filter_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    filters = db.get_filters(user_id)
+
+    if not filters:
+        await update.message.reply_text("❌ No filters to remove.")
+        return ConversationHandler.END
+
+    lines = "\n".join(
+        f"`{i+1}.` `{f['pattern']}` → `{f['replacement']}`"
+        for i, f in enumerate(filters)
+    )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_conv")]])
+    await update.message.reply_text(
+        f"🗑 *Remove Filter*\n\n{lines}\n\nSend the *number* to remove:",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+    return WAITING_REMOVE_FILTER
+
+
+async def receive_remove_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    try:
+        idx = int((update.message.text or "").strip()) - 1
+    except ValueError:
+        await update.message.reply_text("❌ Please send a valid number.")
+        return WAITING_REMOVE_FILTER
+
+    ok = db.remove_filter_by_index(user_id, idx)
+    await update.message.reply_text(
+        "✅ Filter removed." if ok else "❌ Invalid number."
+    )
+    return ConversationHandler.END
+
+
+# ═══════════════════════════════════════════════════════
+#  /blacklist — Manage Blacklist
+# ═══════════════════════════════════════════════════════
+
+async def blacklist_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    items   = db.get_blacklist(user_id)
+    lines   = "\n".join(f"• `{kw}`" for kw in items) if items else "_Empty_"
+
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_conv")]])
+    await update.message.reply_text(
+        "🚫 *Blacklist*\n\n"
+        f"*Current keywords:*\n{lines}\n\n"
+        "Send keyword(s) to block (one per line or comma-separated).\n"
+        "Messages containing any blacklist keyword will be *dropped*.",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+    return WAITING_BLACKLIST
+
+
+async def receive_blacklist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    raw     = (update.message.text or "").strip()
+    keywords = [k.strip() for k in re.split(r"[,\n]+", raw) if k.strip()]
+
+    added = 0
+    for kw in keywords:
+        if db.add_blacklist(user_id, kw):
+            added += 1
+
+    total = len(db.get_blacklist(user_id))
+    await update.message.reply_text(
+        f"✅ Added {added} keyword(s) to blacklist.\n"
+        f"Total blacklist entries: {total}",
+    )
+    return ConversationHandler.END
+
+
+# ═══════════════════════════════════════════════════════
+#  /rem_blacklist — Remove Blacklist Entry
+# ═══════════════════════════════════════════════════════
+
+async def rem_blacklist_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    items   = db.get_blacklist(user_id)
+
+    if not items:
+        await update.message.reply_text("❌ Blacklist is empty.")
+        return ConversationHandler.END
+
+    lines = "\n".join(f"`{i+1}.` `{kw}`" for i, kw in enumerate(items))
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_conv")]])
+    await update.message.reply_text(
+        f"🗑 *Remove Blacklist Entry*\n\n{lines}\n\n"
+        "Send the *number* to remove, or send the keyword directly:",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+    return WAITING_REM_BLACKLIST
+
+
+async def receive_rem_blacklist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    raw     = (update.message.text or "").strip()
+
+    # Try as number first
+    try:
+        idx = int(raw) - 1
+        ok  = db.remove_blacklist_by_index(user_id, idx)
+    except ValueError:
+        ok = db.remove_blacklist(user_id, raw)
+
+    await update.message.reply_text(
+        f"✅ Removed `{raw}` from blacklist." if ok else "❌ Entry not found.",
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END
+
+
+# ═══════════════════════════════════════════════════════
+#  /whitelist — Manage Whitelist
+# ═══════════════════════════════════════════════════════
+
+async def whitelist_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    items   = db.get_whitelist(user_id)
+    lines   = "\n".join(f"• `{kw}`" for kw in items) if items else "_Empty_"
+
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_conv")]])
+    await update.message.reply_text(
+        "✅ *Whitelist*\n\n"
+        f"*Current keywords:*\n{lines}\n\n"
+        "Send keyword(s) to whitelist (one per line or comma-separated).\n"
+        "When non-empty, *only* messages containing a whitelist keyword are forwarded.",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+    return WAITING_WHITELIST
+
+
+async def receive_whitelist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id  = update.effective_user.id
+    raw      = (update.message.text or "").strip()
+    keywords = [k.strip() for k in re.split(r"[,\n]+", raw) if k.strip()]
+
+    added = 0
+    for kw in keywords:
+        if db.add_whitelist(user_id, kw):
+            added += 1
+
+    total = len(db.get_whitelist(user_id))
+    await update.message.reply_text(
+        f"✅ Added {added} keyword(s) to whitelist.\n"
+        f"Total whitelist entries: {total}",
+    )
+    return ConversationHandler.END
+
+
+# ═══════════════════════════════════════════════════════
+#  /rem_whitelist — Remove Whitelist Entry
+# ═══════════════════════════════════════════════════════
+
+async def rem_whitelist_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    items   = db.get_whitelist(user_id)
+
+    if not items:
+        await update.message.reply_text("❌ Whitelist is empty.")
+        return ConversationHandler.END
+
+    lines = "\n".join(f"`{i+1}.` `{kw}`" for i, kw in enumerate(items))
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_conv")]])
+    await update.message.reply_text(
+        f"🗑 *Remove Whitelist Entry*\n\n{lines}\n\n"
+        "Send the *number* to remove, or send the keyword directly:",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+    return WAITING_REM_WHITELIST
+
+
+async def receive_rem_whitelist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    raw     = (update.message.text or "").strip()
+    try:
+        idx = int(raw) - 1
+        ok  = db.remove_whitelist_by_index(user_id, idx)
+    except ValueError:
+        ok = db.remove_whitelist(user_id, raw)
+
+    await update.message.reply_text(
+        f"✅ Removed `{raw}` from whitelist." if ok else "❌ Entry not found.",
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END
+
+
+# ═══════════════════════════════════════════════════════
+#  /delay — Set Forwarding Delay
+# ═══════════════════════════════════════════════════════
+
+async def delay_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    cfg     = db.get_config(user_id)
+    current = cfg.get("delay", 0)
+
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_conv")]])
+    await update.message.reply_text(
+        f"⏱️ *Forwarding Delay*\n\n"
+        f"Current delay: `{current}` seconds\n\n"
+        "Send the delay in seconds (0 = no delay, max 3600):",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+    return WAITING_DELAY
+
+
+async def receive_delay(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    raw     = (update.message.text or "").strip()
+    try:
+        delay = int(raw)
+        if delay < 0 or delay > 3600:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Please send a number between 0 and 3600.")
+        return WAITING_DELAY
+
+    db.set_config(user_id, delay=delay)
+    await update.message.reply_text(
+        f"✅ Delay set to `{delay}` second(s).",
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END
+
+
+# ═══════════════════════════════════════════════════════
+#  /begin_text — Set Prefix Text
+# ═══════════════════════════════════════════════════════
+
+async def begin_text_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    cfg     = db.get_config(user_id)
+    current = cfg.get("begin_text", "") or "_None_"
+
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_conv")]])
+    await update.message.reply_text(
+        f"📝 *Begin Text (Prefix)*\n\n"
+        f"Current: {current}\n\n"
+        "Send the text to prepend before every forwarded message.\n"
+        "Supports [user.first_name], [user.username], [user.id] placeholders.\n\n"
+        "Send `-` to clear the current begin text.",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+    return WAITING_BEGIN_TEXT
+
+
+async def receive_begin_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    raw     = (update.message.text or "").strip()
+
+    if raw == "-":
+        db.set_config(user_id, begin_text="")
+        await update.message.reply_text("✅ Begin text cleared.")
+    else:
+        db.set_config(user_id, begin_text=raw)
+        await update.message.reply_text(
+            f"✅ Begin text set to:\n`{raw}`",
+            parse_mode="Markdown",
+        )
+    return ConversationHandler.END
+
+
+# ═══════════════════════════════════════════════════════
+#  /end_text — Set Suffix Text
+# ═══════════════════════════════════════════════════════
+
+async def end_text_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    cfg     = db.get_config(user_id)
+    current = cfg.get("end_text", "") or "_None_"
+
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_conv")]])
+    await update.message.reply_text(
+        f"📝 *End Text (Suffix)*\n\n"
+        f"Current: {current}\n\n"
+        "Send the text to append after every forwarded message.\n"
+        "Supports [user.first_name], [user.username], [user.id] placeholders.\n\n"
+        "Send `-` to clear the current end text.",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+    return WAITING_END_TEXT
+
+
+async def receive_end_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    raw     = (update.message.text or "").strip()
+
+    if raw == "-":
+        db.set_config(user_id, end_text="")
+        await update.message.reply_text("✅ End text cleared.")
+    else:
+        db.set_config(user_id, end_text=raw)
+        await update.message.reply_text(
+            f"✅ End text set to:\n`{raw}`",
+            parse_mode="Markdown",
+        )
+    return ConversationHandler.END
+
+
+# ═══════════════════════════════════════════════════════
+#  /filter_users — Filter by Sender User IDs
+# ═══════════════════════════════════════════════════════
+
+async def filter_users_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    ufilters = db.get_user_filters(user_id)
+    lines    = "\n".join(f"• `{uid}`" for uid in ufilters) if ufilters else "_Not set (all users)_"
+
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_conv")]])
+    await update.message.reply_text(
+        "👤 *User Filters*\n\n"
+        f"*Allowed sender IDs:*\n{lines}\n\n"
+        "Send user ID(s) to whitelist (space or comma-separated).\n"
+        "When set, only messages from these users are forwarded.\n\n"
+        "Send `-` to clear all user filters (allow everyone).",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+    return WAITING_FILTER_USERS
+
+
+async def receive_filter_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    raw     = (update.message.text or "").strip()
+
+    if raw == "-":
+        db.clear_user_filters(user_id)
+        await update.message.reply_text("✅ User filters cleared. All senders are now allowed.")
+        return ConversationHandler.END
+
+    parts = re.split(r"[\s,]+", raw)
+    added = 0
+    bad   = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        try:
+            uid = int(p)
+            db.add_user_filter(user_id, uid)
+            added += 1
+        except ValueError:
+            bad.append(p)
+
+    msg = f"✅ Added {added} user ID(s) to filter."
+    if bad:
+        msg += f"\n⚠️ Could not parse: `{'`, `'.join(bad)}`"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+    return ConversationHandler.END
+
+
+# ═══════════════════════════════════════════════════════
+#  /config — View Full Configuration
+# ═══════════════════════════════════════════════════════
+
+async def config_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    # Sources
+    sources = db.get_source_channels(user_id)
+    src_lines = "\n".join(f"  • `{s['channel_id']}`" for s in sources) if sources else "  _None_"
+
+    # Destinations
+    dests = db.get_destination_channels(user_id)
+    dst_lines = "\n".join(f"  • `{d['channel_id']}`" for d in dests) if dests else "  _None_"
+
+    # Routes
+    routes = db.get_routes(user_id)
+    rte_lines = "\n".join(
+        f"  `{i+1}.` `{r['source']}` → `{r['destination']}`"
+        for i, r in enumerate(routes)
+    ) if routes else "  _None_"
+
+    # Config
+    cfg = db.get_config(user_id)
+
+    # Filters
+    filters_list = db.get_filters(user_id)
+    flt_lines = ", ".join(f"`{f['pattern']} → {f['replacement']}`" for f in filters_list) or "_[]_"
+
+    # Blacklist / Whitelist / User filters
+    bl  = db.get_blacklist(user_id)
+    wl  = db.get_whitelist(user_id)
+    uf  = db.get_user_filters(user_id)
+
+    bl_str = ", ".join(f"`{k}`" for k in bl) if bl else "_[]_"
+    wl_str = ", ".join(f"`{k}`" for k in wl) if wl else "_[]_"
+    uf_str = ", ".join(f"`{u}`" for u in uf) if uf else "_[]_"
+
+    # Watch status
+    is_watching = (
+        auto_forward_task_user == user_id
+        and (bool(_route_handlers) or auto_forward_handler is not None)
+    )
+
+    def yn(val):
+        return "Enabled" if val else "Disabled"
+
+    text = (
+        "⚙️ *Current Configuration*\n\n"
+        f"📥 *Sources:*\n{src_lines}\n\n"
+        f"📤 *Destinations:*\n{dst_lines}\n\n"
+        f"🗺 *Routes:*\n{rte_lines}\n\n"
+        f"⏱️ *Delay:* `{cfg['delay']}` seconds\n"
+        f"📝 *Begin Text:* `{cfg['begin_text'] or 'None'}`\n"
+        f"📝 *End Text:* `{cfg['end_text'] or 'None'}`\n"
+        f"📋 *Copy Mode:* `{'Copy (no tag)' if cfg['copy_mode'] else 'Forward (with tag)'}`\n"
+        f"🖼 *Media Forwarding:* {yn(cfg['media_enabled'])}\n"
+        f"💬 *Text Forwarding:* {yn(cfg['text_enabled'])}\n"
+        f"🔗 *URL Preview:* {yn(cfg['url_preview'])}\n"
+        f"✏️ *Edit Sync:* {yn(cfg['edit_sync'])}\n"
+        f"🗑 *Delete Sync:* {yn(cfg['delete_sync'])}\n\n"
+        f"🔤 *Text Filters:* {flt_lines}\n"
+        f"🚫 *Blacklist:* {bl_str}\n"
+        f"✅ *Whitelist:* {wl_str}\n"
+        f"👤 *User Filters:* {uf_str}\n\n"
+        f"🔴 *Forwarding Status:* `{'RUNNING' if is_watching else 'STOPPED'}`"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# ═══════════════════════════════════════════════════════
+#  /reset_config — Reset All Settings to Defaults
+# ═══════════════════════════════════════════════════════
+
+async def reset_config_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes, reset", callback_data="confirm_reset_config"),
+        InlineKeyboardButton("❌ Cancel",     callback_data="cancel_conv"),
+    ]])
+    await update.message.reply_text(
+        "⚠️ *Reset Configuration*\n\n"
+        "This will reset delay, begin/end text, copy mode, media/text toggle, "
+        "URL preview, edit/delete sync to their defaults.\n\n"
+        "*Routes, sources, destinations, filters, blacklist, and whitelist will NOT be affected.*\n\n"
+        "Are you sure?",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+
+
+# ═══════════════════════════════════════════════════════
+#  /remove_session — Remove the Stored Session
+# ═══════════════════════════════════════════════════════
+
+async def remove_session_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    global userbot_client
+
+    session = db.get_session(user_id)
+    if not session:
+        await update.message.reply_text("❌ No session stored.")
+        return
+
+    # Disconnect live client
+    _stop_auto_forward(userbot_client)
+    if userbot_client:
+        try:
+            await userbot_client.disconnect()
+        except Exception:
+            pass
+        userbot_client = None
+
+    db.delete_session(user_id)
+    db.set_watch_active(user_id, False)
+
+    await update.message.reply_text(
+        "✅ *Session removed.*\n\n"
+        "Userbot disconnected. Use /login to connect a new session.",
+        parse_mode="Markdown",
+    )
+
+
+# ═══════════════════════════════════════════════════════
+#  /delete — Delete All User Data
+# ═══════════════════════════════════════════════════════
+
+async def delete_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🗑 Yes, delete everything", callback_data="confirm_delete_all"),
+        InlineKeyboardButton("❌ Cancel",                 callback_data="cancel_conv"),
+    ]])
+    await update.message.reply_text(
+        "☢️ *Delete All My Data*\n\n"
+        "This will permanently delete:\n"
+        "• Your session\n"
+        "• All sources & destinations\n"
+        "• All routes\n"
+        "• All filters, blacklist, whitelist\n"
+        "• All configuration\n\n"
+        "⚠️ *This cannot be undone.*",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+
+
+# ═══════════════════════════════════════════════════════
+#  TOGGLE SETTINGS  (copy/forward mode, media, text, url preview, edit/delete sync)
+# ═══════════════════════════════════════════════════════
+
+async def toggle_config_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Generic toggle handler. Usage: /copy_mode, /toggle_media, /toggle_text,
+    /toggle_url_preview, /toggle_edit_sync, /toggle_delete_sync
+    """
+    user_id = update.effective_user.id
+    cmd     = (update.message.text or "").lstrip("/").split()[0].lower()
+
+    toggle_map = {
+        "copy_mode":         ("copy_mode",      "Copy mode",          "Copy (no tag)",   "Forward (with tag)"),
+        "toggle_media":      ("media_enabled",   "Media forwarding",   "Enabled",         "Disabled"),
+        "toggle_text":       ("text_enabled",    "Text forwarding",    "Enabled",         "Disabled"),
+        "toggle_url_preview":("url_preview",     "URL preview",        "Enabled",         "Disabled"),
+        "toggle_edit_sync":  ("edit_sync",       "Edit sync",          "Enabled",         "Disabled"),
+        "toggle_delete_sync":("delete_sync",     "Delete sync",        "Enabled",         "Disabled"),
+    }
+
+    if cmd not in toggle_map:
+        await update.message.reply_text("❌ Unknown toggle command.")
+        return
+
+    key, label, on_label, off_label = toggle_map[cmd]
+    cfg     = db.get_config(user_id)
+    new_val = not cfg.get(key, True)
+    db.set_config(user_id, **{key: new_val})
+    state = on_label if new_val else off_label
+    await update.message.reply_text(
+        f"✅ *{label}:* {state}",
+        parse_mode="Markdown",
+    )
+
 
 # ═══════════════════════════════════════════════════════
 #  HEALTH CHECK SERVER  (required for Koyeb Web Service)
@@ -2447,13 +3766,186 @@ def main():
         per_message=False,
     )
 
-    # ConversationHandlers must be registered before the generic button_handler
+    incoming_conv = ConversationHandler(
+        entry_points=[CommandHandler("incoming", incoming_command)],
+        states={
+            WAITING_INCOMING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_incoming)
+            ],
+        },
+        fallbacks=[CallbackQueryHandler(button_handler, pattern="^cancel_conv$")],
+        per_message=False,
+    )
+
+    outgoing_conv = ConversationHandler(
+        entry_points=[CommandHandler("outgoing", outgoing_command)],
+        states={
+            WAITING_OUTGOING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_outgoing)
+            ],
+        },
+        fallbacks=[CallbackQueryHandler(button_handler, pattern="^cancel_conv$")],
+        per_message=False,
+    )
+
+    add_route_conv = ConversationHandler(
+        entry_points=[CommandHandler("add_route", add_route_command)],
+        states={
+            WAITING_ADD_ROUTE_SRC: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_add_route_src)
+            ],
+            WAITING_ADD_ROUTE_DST: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_add_route_dst)
+            ],
+        },
+        fallbacks=[CallbackQueryHandler(button_handler, pattern="^cancel_conv$")],
+        per_message=False,
+    )
+
+    remove_route_conv = ConversationHandler(
+        entry_points=[CommandHandler("remove_route", remove_route_command)],
+        states={
+            WAITING_REMOVE_ROUTE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_remove_route)
+            ],
+        },
+        fallbacks=[CallbackQueryHandler(button_handler, pattern="^cancel_conv$")],
+        per_message=False,
+    )
+
+    filter_conv = ConversationHandler(
+        entry_points=[CommandHandler("filter", filter_command)],
+        states={
+            WAITING_FILTER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_filter)
+            ],
+        },
+        fallbacks=[CallbackQueryHandler(button_handler, pattern="^cancel_conv$")],
+        per_message=False,
+    )
+
+    remove_filter_conv = ConversationHandler(
+        entry_points=[CommandHandler("remove_filter", remove_filter_command)],
+        states={
+            WAITING_REMOVE_FILTER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_remove_filter)
+            ],
+        },
+        fallbacks=[CallbackQueryHandler(button_handler, pattern="^cancel_conv$")],
+        per_message=False,
+    )
+
+    blacklist_conv = ConversationHandler(
+        entry_points=[CommandHandler("blacklist", blacklist_command)],
+        states={
+            WAITING_BLACKLIST: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_blacklist)
+            ],
+        },
+        fallbacks=[CallbackQueryHandler(button_handler, pattern="^cancel_conv$")],
+        per_message=False,
+    )
+
+    rem_blacklist_conv = ConversationHandler(
+        entry_points=[CommandHandler("rem_blacklist", rem_blacklist_command)],
+        states={
+            WAITING_REM_BLACKLIST: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_rem_blacklist)
+            ],
+        },
+        fallbacks=[CallbackQueryHandler(button_handler, pattern="^cancel_conv$")],
+        per_message=False,
+    )
+
+    whitelist_conv = ConversationHandler(
+        entry_points=[CommandHandler("whitelist", whitelist_command)],
+        states={
+            WAITING_WHITELIST: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_whitelist)
+            ],
+        },
+        fallbacks=[CallbackQueryHandler(button_handler, pattern="^cancel_conv$")],
+        per_message=False,
+    )
+
+    rem_whitelist_conv = ConversationHandler(
+        entry_points=[CommandHandler("rem_whitelist", rem_whitelist_command)],
+        states={
+            WAITING_REM_WHITELIST: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_rem_whitelist)
+            ],
+        },
+        fallbacks=[CallbackQueryHandler(button_handler, pattern="^cancel_conv$")],
+        per_message=False,
+    )
+
+    delay_conv = ConversationHandler(
+        entry_points=[CommandHandler("delay", delay_command)],
+        states={
+            WAITING_DELAY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_delay)
+            ],
+        },
+        fallbacks=[CallbackQueryHandler(button_handler, pattern="^cancel_conv$")],
+        per_message=False,
+    )
+
+    begin_text_conv = ConversationHandler(
+        entry_points=[CommandHandler("begin_text", begin_text_command)],
+        states={
+            WAITING_BEGIN_TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_begin_text)
+            ],
+        },
+        fallbacks=[CallbackQueryHandler(button_handler, pattern="^cancel_conv$")],
+        per_message=False,
+    )
+
+    end_text_conv = ConversationHandler(
+        entry_points=[CommandHandler("end_text", end_text_command)],
+        states={
+            WAITING_END_TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_end_text)
+            ],
+        },
+        fallbacks=[CallbackQueryHandler(button_handler, pattern="^cancel_conv$")],
+        per_message=False,
+    )
+
+    filter_users_conv = ConversationHandler(
+        entry_points=[CommandHandler("filter_users", filter_users_command)],
+        states={
+            WAITING_FILTER_USERS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_filter_users)
+            ],
+        },
+        fallbacks=[CallbackQueryHandler(button_handler, pattern="^cancel_conv$")],
+        per_message=False,
+    )
+
+    # ── Register all handlers (ConversationHandlers first, then Commands) ──
     app.add_handler(login_conv)
     app.add_handler(dest_conv)
     app.add_handler(forward_conv)
     app.add_handler(save_conv)
     app.add_handler(watch_conv)
+    # New route & filter conversation handlers
+    app.add_handler(incoming_conv)
+    app.add_handler(outgoing_conv)
+    app.add_handler(add_route_conv)
+    app.add_handler(remove_route_conv)
+    app.add_handler(filter_conv)
+    app.add_handler(remove_filter_conv)
+    app.add_handler(blacklist_conv)
+    app.add_handler(rem_blacklist_conv)
+    app.add_handler(whitelist_conv)
+    app.add_handler(rem_whitelist_conv)
+    app.add_handler(delay_conv)
+    app.add_handler(begin_text_conv)
+    app.add_handler(end_text_conv)
+    app.add_handler(filter_users_conv)
 
+    # Existing commands (unchanged)
     app.add_handler(CommandHandler("start",    start))
     app.add_handler(CommandHandler("help",     help_command))
     app.add_handler(CommandHandler("settings", settings_command))
@@ -2461,32 +3953,72 @@ def main():
     app.add_handler(CommandHandler("cleanup",  cleanup_command))
     app.add_handler(CommandHandler("status",   status_command))
     app.add_handler(CommandHandler("unwatch",  unwatch_command))
+    # New simple commands
+    app.add_handler(CommandHandler("routes",         routes_command))
+    app.add_handler(CommandHandler("config",         config_command))
+    app.add_handler(CommandHandler("reset_config",   reset_config_command))
+    app.add_handler(CommandHandler("remove_session", remove_session_command))
+    app.add_handler(CommandHandler("delete",         delete_command))
+    # Toggle commands
+    for _tcmd in ["copy_mode", "toggle_media", "toggle_text",
+                  "toggle_url_preview", "toggle_edit_sync", "toggle_delete_sync"]:
+        app.add_handler(CommandHandler(_tcmd, toggle_config_command))
+
     app.add_handler(CallbackQueryHandler(button_handler))
 
     async def post_init(application):
         await application.bot.set_my_commands([
-            BotCommand("start",    "Welcome message"),
-            BotCommand("help",     "Show all commands"),
-            BotCommand("login",    "Connect userbot (session or phone)"),
-            BotCommand("settings", "Manage destination channels"),
-            BotCommand("forward",  "Copy a message range to destinations"),
-            BotCommand("save",     "Fetch & repost a single restricted message"),
-            BotCommand("watch",    "Auto-forward new messages from a channel"),
-            BotCommand("unwatch",  "Stop auto-forwarding"),
-            BotCommand("status",   "Show bot status & downloads folder info"),
-            BotCommand("cleanup",  "Cleanup old downloaded files"),
-            BotCommand("stop",     "Stop active copy job"),
+            # ── Core ─────────────────────────────────────
+            BotCommand("start",          "Welcome message"),
+            BotCommand("help",           "Show all commands"),
+            BotCommand("login",          "Connect userbot (session or phone)"),
+            BotCommand("settings",       "Manage destination channels"),
+            BotCommand("status",         "Show bot status & downloads folder info"),
+            # ── Forwarding ───────────────────────────────
+            BotCommand("watch",          "Start auto-forwarding (route-based or legacy)"),
+            BotCommand("unwatch",        "Stop auto-forwarding"),
+            BotCommand("routes",         "List all forwarding routes"),
+            BotCommand("add_route",      "Add a source → destination route"),
+            BotCommand("remove_route",   "Remove a route"),
+            BotCommand("incoming",       "Add source channel"),
+            BotCommand("outgoing",       "Add destination channel"),
+            # ── Batch copy ───────────────────────────────
+            BotCommand("forward",        "Copy a message range to destinations"),
+            BotCommand("save",           "Fetch & repost a single restricted message"),
+            BotCommand("stop",           "Stop active copy job"),
+            # ── Filters ──────────────────────────────────
+            BotCommand("filter",         "Add text replacement filter (old ==> new)"),
+            BotCommand("remove_filter",  "Remove a text filter"),
+            BotCommand("blacklist",      "Add blacklist keywords"),
+            BotCommand("rem_blacklist",  "Remove blacklist keyword"),
+            BotCommand("whitelist",      "Add whitelist keywords"),
+            BotCommand("rem_whitelist",  "Remove whitelist keyword"),
+            BotCommand("filter_users",   "Only forward from specific user IDs"),
+            # ── Settings ─────────────────────────────────
+            BotCommand("delay",          "Set forwarding delay in seconds"),
+            BotCommand("begin_text",     "Set prefix text for forwarded messages"),
+            BotCommand("end_text",       "Set suffix text for forwarded messages"),
+            BotCommand("copy_mode",      "Toggle copy vs native forward mode"),
+            BotCommand("toggle_media",   "Toggle media forwarding on/off"),
+            BotCommand("toggle_text",    "Toggle text message forwarding on/off"),
+            BotCommand("toggle_edit_sync",   "Toggle edit sync (mirror edits)"),
+            BotCommand("toggle_delete_sync", "Toggle delete sync (mirror deletes)"),
+            BotCommand("config",         "View full current configuration"),
+            BotCommand("reset_config",   "Reset settings to defaults"),
+            # ── Account ──────────────────────────────────
+            BotCommand("remove_session", "Remove stored userbot session"),
+            BotCommand("cleanup",        "Cleanup old downloaded files"),
+            BotCommand("delete",         "Permanently delete all your data"),
         ])
 
         # ── Restart-recovery: resume any active auto-forward sessions ──
-        # When the bot restarts (e.g. Koyeb redeploy), re-attach the
-        # Telethon event handler for any user who had /watch active.
+        # The upgraded _start_auto_forward auto-detects routes vs legacy mode.
         try:
             active_watches = db.get_all_active_watches()
             for watch in active_watches:
                 uid = watch["user_id"]
-                src = watch["source_channel"]
-                logger.info(f"Restart-recovery: resuming auto-forward for user {uid} → {src}")
+                src = watch.get("source_channel")
+                logger.info(f"Restart-recovery: resuming auto-forward for user {uid}")
                 ok = await _start_auto_forward(uid, src)
                 if not ok:
                     logger.warning(f"Restart-recovery: failed to resume watch for user {uid}")
